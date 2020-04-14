@@ -2,9 +2,9 @@ name: CI
 
 on:
   push:
-    branches: [ master ]
+    branches: [ branch_docker_publish ]
   pull_request:
-    branches: [ master ]
+    branches: [ branch_docker_publish ]
 
 jobs:
   build:
@@ -12,7 +12,7 @@ jobs:
     runs-on: ${{ matrix.os }}
     strategy:
       matrix:
-        os: [ubuntu-latest, macOS-latest]
+        os: [ubuntu-latest]
 
     steps:
     - uses: actions/checkout@v2
@@ -51,3 +51,25 @@ jobs:
         name: zenoh-${{ matrix.os }}
         # Directory containing files to upload
         path: _build/default/install
+
+  docker:
+    name: Build and publish Docker image
+    needs: build
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v2
+      - name: Download ubuntu-latest
+        uses: actions/download-artifact@v1
+        with:
+          name: zenoh-ubuntu-latest
+      - name: ls
+        run: ls -al
+      - name: ls zenoh-ubuntu-latest
+        run: ls -al zenoh-ubuntu-latest*
+      - name: Build and publish Docker image
+        uses: elgohr/Publish-Docker-Github-Action@master
+        with:
+          name: adlinktech/eclipse-zenoh
+          username: ${{ secrets.DOCKER_USERNAME }}
+          password: ${{ secrets.DOCKER_PASSWORD }}
+          tags: "latest"
