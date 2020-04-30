@@ -8,8 +8,15 @@ RUN apt-get install -y libev-dev libsqlite3-dev libmariadb-dev postgresql-client
 COPY zenoh-ubuntu-latest /eclipse-zenoh
 RUN chmod +x /eclipse-zenoh/bin/zenohd.exe
 
+RUN echo '#!/bin/bash' > /entrypoint.sh
+RUN echo 'service influxdb start' >> /entrypoint.sh
+RUN echo 'echo " * Starting: /eclipse-zenoh/bin/zenohd.exe $*"' >> /entrypoint.sh
+RUN echo 'exec /eclipse-zenoh/bin/zenohd.exe $*' >> /entrypoint.sh
+RUN chmod +x /entrypoint.sh
+
 EXPOSE 7447/udp
 EXPOSE 7447/tcp
 EXPOSE 8000/tcp
 
-ENTRYPOINT service influxdb start && exec /eclipse-zenoh/bin/zenohd.exe -vv
+ENTRYPOINT ["/entrypoint.sh"]
+CMD [ "-v" ]
