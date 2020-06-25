@@ -43,11 +43,15 @@ zconfigurable! {
     pub(crate) static ref QUEUE_SIZE_RETX: usize = 64;
     pub(crate) static ref QUEUE_CRED_RETX: isize = 1;
 
-    pub(crate) static ref QUEUE_PRIO_DATA: usize = 2;
-    pub(crate) static ref QUEUE_SIZE_DATA: usize = 1_024;
+    pub(crate) static ref QUEUE_PRIO_FRAG: usize = 2;
+    pub(crate) static ref QUEUE_SIZE_FRAG: usize = 64;
+    pub(crate) static ref QUEUE_CRED_FRAG: isize = 1;
+
+    pub(crate) static ref QUEUE_PRIO_DATA: usize = 3;
+    pub(crate) static ref QUEUE_SIZE_DATA: usize = 256;
     pub(crate) static ref QUEUE_CRED_DATA: isize = 100;
 
-    pub(crate) static ref QUEUE_SIZE_TOT: usize = *QUEUE_SIZE_CTRL + *QUEUE_SIZE_RETX + *QUEUE_SIZE_DATA;
+    pub(crate) static ref QUEUE_SIZE_TOT: usize = *QUEUE_SIZE_CTRL + *QUEUE_SIZE_RETX + *QUEUE_SIZE_FRAG + *QUEUE_SIZE_DATA;
     pub(crate) static ref QUEUE_CONCURRENCY: usize = 16;
 
     pub(crate) static ref WRITE_MSG_SLICE_SIZE: usize = 128;

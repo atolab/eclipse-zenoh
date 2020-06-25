@@ -18,10 +18,9 @@ use std::collections::HashMap;
 use std::fmt;
 use std::time::Duration;
 
-use crate::core::{PeerId, ZInt};
-use crate::link::{Link, LinkManager, LinkManagerBuilder, Locator, LocatorProtocol};
-use crate::proto::{Attachment, WhatAmI, ZenohMessage, smsg};
-use crate::session::defaults::{
+use super::{InitialSession, MsgHandler, SessionHandler, Transport};
+use super::channel::Channel;
+use super::defaults::{
     SESSION_BATCH_SIZE, 
     SESSION_LEASE, 
     SESSION_KEEP_ALIVE,
@@ -29,7 +28,10 @@ use crate::session::defaults::{
     SESSION_OPEN_RETRIES, 
     SESSION_SEQ_NUM_RESOLUTION
 };
-use crate::session::{Channel, InitialSession, MsgHandler, SessionHandler, Transport};
+
+use crate::core::{PeerId, ZInt};
+use crate::link::{Link, LinkManager, LinkManagerBuilder, Locator, LocatorProtocol};
+use crate::proto::{Attachment, WhatAmI, ZenohMessage, smsg};
 
 use zenoh_util::{zasyncread, zasyncwrite, zerror};
 use zenoh_util::core::{ZResult, ZError, ZErrorKind};
@@ -541,6 +543,11 @@ impl Session {
     pub fn get_peer(&self) -> ZResult<PeerId> {
         let channel = zweak!(self.0, STR_ERR);
         Ok(channel.get_peer())
+    }
+
+    pub fn get_whatami(&self) -> ZResult<WhatAmI> {
+        let channel = zweak!(self.0, STR_ERR);
+        Ok(channel.get_whatami())
     }
 
     pub fn get_lease(&self) -> ZResult<ZInt> {
