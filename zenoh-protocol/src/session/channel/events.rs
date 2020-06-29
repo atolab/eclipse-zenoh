@@ -11,12 +11,12 @@
 // Contributors:
 //   ADLINK zenoh team, <zenoh@adlink-labs.tech>
 //
-use async_std::sync::Weak;
+use async_std::sync::{Arc, Weak};
 use async_trait::async_trait;
 use std::collections::HashSet;
 use std::iter::FromIterator;
 
-use super::{Channel, MessageInner, MessageTx};
+use super::{Channel, LinkQueue};
 
 use crate::link::Link;
 use crate::proto::{SessionMessage, smsg};
@@ -29,14 +29,15 @@ use zenoh_util::collections::Timed;
 /*            KEEP ALIVE             */
 /*************************************/
 pub(super) struct KeepAliveEvent {
-    ch: Weak<Channel>,
+    queue: Arc<LinkQueue>,
+    #[cfg(debug_assertions)]
     link: Link
 }
 
 impl KeepAliveEvent {
-    pub(super) fn new(ch: Weak<Channel>, link: Link) -> KeepAliveEvent {
+    pub(super) fn new(queue: Arc<LinkQueue>, link: Link) -> KeepAliveEvent {
         KeepAliveEvent {
-            ch,
+            queue,
             link
         }
     }
@@ -45,19 +46,14 @@ impl KeepAliveEvent {
 #[async_trait]
 impl Timed for KeepAliveEvent {
     async fn run(&mut self) {
-        log::trace!("Schedule KEEP_ALIVE messages for link: {}", self.link);        
-        if let Some(ch) = self.ch.upgrade() {
-            // Create the KEEP_ALIVE message
-            let pid = None;
-            let attachment = None;
-            let message = MessageTx {
-                inner: MessageInner::Session(SessionMessage::make_keep_alive(pid, attachment)),
-                link: Some(self.link.clone())
-            };
+        log::trace!("Schedule KEEP_ALIVE messages for link: {}", self.link);
+        // Create the KEEP_ALIVE message
+        let pid = None;
+        let attachment = None;
+        let message = SessionMessage::make_keep_alive(pid, attachment);
 
-            // Push the KEEP_ALIVE messages on the queue
-            ch.queue.push(message, *QUEUE_PRIO_CTRL).await;
-        }
+        // Push the KEEP_ALIVE messages on the queue
+        self.queue.push_session_message(message, QUEUE_PRIO_CTRL).await;
     }
 }
 

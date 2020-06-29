@@ -73,8 +73,8 @@ impl SCRouter {
     pub fn new(resolution: ZInt) -> Self {
         Self {
             count: AtomicUsize::new(0),
-            last_reliable: Mutex::new(SeqNum::make(resolution-1, resolution).unwrap()),
-            last_unreliable: Mutex::new(SeqNum::make(resolution-1, resolution).unwrap())
+            last_reliable: Mutex::new(SeqNum::new(resolution-1, resolution)),
+            last_unreliable: Mutex::new(SeqNum::new(resolution-1, resolution))
         }
     }
 }

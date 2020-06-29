@@ -185,6 +185,7 @@ async fn timer_task(
     }
 }
 
+#[derive(Clone)]
 pub struct Timer {
     events: Arc<Mutex<BinaryHeap<TimedEvent>>>,
     sl_sender: Option<Sender<()>>,

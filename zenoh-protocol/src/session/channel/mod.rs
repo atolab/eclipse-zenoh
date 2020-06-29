@@ -13,15 +13,17 @@
 //
 mod batch;
 mod events;
-mod links;
+mod link;
+mod link_queue;
 mod main;
+mod reliability_queue;
 mod rx;
-mod tx;
 
 use batch::*;
 use events::*;
-use links::*;
+use link::*;
+use link_queue::*;
+use reliability_queue::*;
 use rx::*;
-use tx::*;
 
 pub(crate) use main::*;

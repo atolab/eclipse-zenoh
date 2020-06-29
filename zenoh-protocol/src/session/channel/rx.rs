@@ -46,8 +46,8 @@ impl SeqNumRx {
             initial_sn - 1
         };
         SeqNumRx {
-            reliable: SeqNum::make(initial_sn, sn_resolution).unwrap(),
-            best_effort: SeqNum::make(initial_sn, sn_resolution).unwrap(),
+            reliable: SeqNum::new(initial_sn, sn_resolution),
+            best_effort: SeqNum::new(initial_sn, sn_resolution),
         }
     }
 }
@@ -77,62 +77,102 @@ impl Channel {
     /*   MESSAGE RECEIVED FROM THE LINK  */
     /*************************************/
     async fn process_reliable_frame(&self, sn: ZInt, payload: FramePayload) -> Action {
-        // @TODO: Implement the reordering and reliability. Wait for missing messages.
-        let mut guard = zasynclock!(self.rx);        
-        if !(guard.sn.reliable.precedes(sn) && guard.sn.reliable.set(sn).is_ok()) {
-            log::warn!("Reliable frame with invalid SN dropped: {}", sn);
-            return Action::Read
-        }
-
-        let callback = if let Some(callback) = &guard.callback {
-            callback
-        } else {
-            log::error!("Reliable frame dropped because callback is unitialized: {:?}", payload);
-            return Action::Read
-        };
-
-        match payload {
-            FramePayload::Fragment { .. } => {
-                unimplemented!("Fragmentation not implemented");
-            },
-            FramePayload::Messages { mut messages } => {
-                for msg in messages.drain(..) {
-                    log::trace!("Session: {}. Message: {:?}", self.get_peer(), msg);
-                    let _ = callback.handle_message(msg).await;
-                }
-            }
-        }
-        
         Action::Read
+
+        // @TODO: Implement the reordering and reliability. Wait for missing messages.
+        // let mut guard = zasynclock!(self.rx);
+
+        // Add the frame to the reliability queue for reordering
+        // match guard.reliable.insert(payload, sn) {
+        //     Ok(_) => {
+        //         // Drain all the queue
+        //         while let Some(payload) = guard.reliable.pull() {
+        //             match payload {
+        //                 FramePayload::Fragment { .. } => {
+        //                     unimplemented!("Fragmentation not implemented");
+        //                 },
+        //                 FramePayload::Messages { mut messages } => {
+        //                     for msg in messages.drain(..) {
+        //                         log::trace!("Session: {}. Message: {:?}", self.get_peer(), msg);
+        //                         let _ = guard.get_callback_ref().handle_message(msg).await;
+        //                     }
+        //                 }
+        //             }
+        //         }
+                
+        //         // Keep reading
+        //         Action::Read
+        //     }
+        //     Err(e) => match e.get_kind() {
+        //         ZErrorKind::InvalidResolution { .. } => {
+        //             log::warn!("Invalid SN in reliable frame: {}. \
+        //                         Closing the session with peer: {}", e, self.get_peer());
+        //             // Drop the guard before closing the session
+        //             drop(guard);
+        //             // Delete the whole session
+        //             self.delete().await;
+        //             // Close the link
+        //             Action::Close
+        //         },
+        //         _ => {
+        //             log::warn!("Reliable frame with invalid SN dropped: {}", e);
+
+        //             // We are out of sync, schedule an ACK_NACK
+        //             let sn = guard.reliable.get_base();
+        //             let mask = guard.reliable.get_mask();
+        //             let attachment = None;
+        //             let acknack = SessionMessage::make_ack_nack(sn, Some(mask), attachment);
+                    
+        //             let msg = MessageTx::Session(acknack, link.clone());
+        //             self.queue.push(msg, *QUEUE_PRIO_CTRL).await;
+
+        //             // Keep reading
+        //             Action::Read
+        //         }
+        //     }
+        // }        
     }
 
     async fn process_best_effort_frame(&self, sn: ZInt, payload: FramePayload) -> Action {
-        let mut guard = zasynclock!(self.rx);
-        if !(guard.sn.best_effort.precedes(sn) && guard.sn.best_effort.set(sn).is_ok()) {
-            log::warn!("Best-effort frame with invalid SN dropped: {}", sn);
-            return Action::Read
-        }
-
-        let callback = if let Some(callback) = &guard.callback {
-            callback
-        } else {
-            log::error!("Best-effort frame dropped because callback is unitialized: {:?}", payload);
-            return Action::Read
-        };
-
-        match payload {
-            FramePayload::Fragment { .. } => {
-                unimplemented!("Fragmentation not implemented");
-            },
-            FramePayload::Messages { mut messages } => {
-                for msg in messages.drain(..) {
-                    log::trace!("Session: {}. Message: {:?}", self.get_peer(), msg);
-                    let _ = callback.handle_message(msg).await;
-                }              
-            }
-        }
-        
         Action::Read
+        
+        // let mut guard = zasynclock!(self.rx);
+
+        // match guard.best_effort.precedes(sn) {
+        //     Ok(precedes) => if precedes {
+        //         // Set will always return OK because we have already checked
+        //         // with precedes() that the sn has the right resolution
+        //         let _ = guard.best_effort.set(sn);
+        //         match payload {
+        //             FramePayload::Fragment { .. } => {
+        //                 unimplemented!("Fragmentation not implemented");
+        //             },
+        //             FramePayload::Messages { mut messages } => {
+        //                 for msg in messages.drain(..) {
+        //                     log::trace!("Session: {}. Message: {:?}", self.get_peer(), msg);
+        //                     let _ = guard.get_callback_ref().handle_message(msg).await;
+        //                 }                        
+        //             }
+        //         }
+        //         // Keep reading
+        //         Action::Read
+        //     } else {
+        //         log::warn!("Best effort frame with invalid SN dropped: {}", sn);
+        //         // @TODO: Drop the fragments if needed
+        //         // Keep reading
+        //         Action::Read
+        //     },
+        //     Err(e) => {
+        //         log::warn!("Invalid SN in best effort frame: {}. \
+        //                     Closing the session with peer: {}", e, self.get_peer());
+        //         // Drop the guard before closing the session
+        //         drop(guard);
+        //         // Delete the whole session
+        //         self.delete().await;
+        //         // Close the link
+        //         Action::Close
+        //     }
+        // }
     }
 
     async fn process_close(&self, link: &Link, pid: Option<PeerId>, reason: u8, link_only: bool) -> Action {

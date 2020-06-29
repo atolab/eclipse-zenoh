@@ -233,10 +233,6 @@ impl LinkTrait for Tcp {
         DEFAULT_MTU
     }
 
-    fn is_ordered(&self) -> bool {
-        true
-    }
-
     fn is_reliable(&self) -> bool {
         true
     }
