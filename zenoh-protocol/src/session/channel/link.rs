@@ -11,36 +11,64 @@
 // Contributors:
 //   ADLINK zenoh team, <zenoh@adlink-labs.tech>
 //
-use async_std::sync::{Arc, Barrier, Mutex};
+use async_std::prelude::*;
+use async_std::sync::{Arc, Barrier, Mutex, Receiver, Sender, Weak, channel};
 use async_std::task;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::time::Duration;
 
-use super::{LinkQueue, KeepAliveEvent};
+use super::{Channel, KeepAliveEvent, LinkLeaseEvent, TransmissionQueue};
 
 use crate::core::ZInt;
 use crate::link::Link;
 use crate::proto::{SeqNumGenerator, SessionMessage, ZenohMessage};
 
+use zenoh_util::zerror;
 use zenoh_util::collections::{TimedEvent, TimedHandle, Timer};
-use zenoh_util::core::ZResult;
+use zenoh_util::core::{ZError, ZErrorKind, ZResult};
 
 
 // Consume task
 async fn consume_task(
-    queue: Arc<LinkQueue>, 
+    queue: Arc<TransmissionQueue>, 
     link: Link,
     active: Arc<AtomicBool>,
+    receiver: Receiver<()>,
     barrier: Arc<Barrier>
 ) -> ZResult<()> {
-    // Keep draining the queue while active
-    while active.load(Ordering::Relaxed) {
+    enum Action {
+        Continue,
+        Stop
+    }
+
+    async fn consume(queue: &Arc<TransmissionQueue>, link: &Link) -> ZResult<Action> {
         // Pull a serialized batch from the queue
         let (batch, index) = queue.pull().await;
         // Send the buffer on the link
         link.send(batch.get_buffer()).await?;
         // Reinsert the batch into the queue
         queue.push_serialization_batch(batch, index).await;
+        
+        Ok(Action::Continue)
+    }
+
+    async fn signal(receiver: &Receiver<()>) -> ZResult<Action> {
+        let res = receiver.recv().await;
+        match res {
+            Ok(_) => Ok(Action::Stop),
+            Err(_) => zerror!(ZErrorKind::Other {
+                descr: "Signal error".to_string()
+            })
+        }       
+    }
+
+    // Keep draining the queue while active
+    while active.load(Ordering::Relaxed) {        
+        let action = consume(&queue, &link).race(signal(&receiver)).await?;
+        match action {
+            Action::Continue => continue,
+            Action::Stop => break
+        }
     }
 
     // Drain what remains in the queue before exiting
@@ -54,31 +82,63 @@ async fn consume_task(
     Ok(())
 }
 
+pub(super) struct LinkAlive {
+    inner: AtomicBool
+}
+
+impl LinkAlive {
+    fn new() -> LinkAlive {
+        LinkAlive { 
+            inner: AtomicBool::new(true)
+        }
+    }
+
+    #[inline]    
+    pub(super) fn get(&self) -> bool {
+        self.inner.load(Ordering::Relaxed)
+    }
+
+    #[inline]    
+    pub(super) fn mark(&self) {
+        self.inner.store(true, Ordering::Relaxed);
+    }
+
+    #[inline]    
+    pub(super) fn clear(&self) {
+        self.inner.store(false, Ordering::Relaxed);
+    }
+}
+
 #[derive(Clone)]
 pub(super) struct ChannelLink {
     link: Link,
-    queue: Arc<LinkQueue>,
+    queue: Arc<TransmissionQueue>,
     active: Arc<AtomicBool>,
-    barrier: Arc<Barrier>,
-    handle: TimedHandle
+    alive: Arc<LinkAlive>,
+    barrier: Arc<Barrier>,    
+    handles: Vec<TimedHandle>,
+    signal: Sender<()>
 }
 
 impl ChannelLink {
     pub(super) fn new(
+        ch: Weak<Channel>,
         link: Link,
         batch_size: usize,
         keep_alive: ZInt,
+        lease: ZInt,
         sn_reliable: Arc<Mutex<SeqNumGenerator>>,
         sn_best_effort: Arc<Mutex<SeqNumGenerator>>,
         timer: Timer
     ) -> ChannelLink {
         // The queue
-        let queue = Arc::new(LinkQueue::new(
+        let queue = Arc::new(TransmissionQueue::new(
             batch_size.min(link.get_mtu()), link.is_streamed(), sn_reliable, sn_best_effort
         ));
 
-        // Control variable
+        // Control variables
         let active = Arc::new(AtomicBool::new(true));
+        let alive = Arc::new(LinkAlive::new());
 
         // Barrier for sincronization
         let barrier = Arc::new(Barrier::new(2));
@@ -89,22 +149,44 @@ impl ChannelLink {
         let interval = Duration::from_millis(keep_alive);
         let event = TimedEvent::periodic(interval, event);
         // Get the handle of the periodic event
-        let handle = event.get_handle();
+        let ka_handle = event.get_handle();
+
+        // Lease event
+        let event = LinkLeaseEvent::new(ch.clone(), alive.clone(), link.clone());
+        // Keep alive interval is expressed in milliseconds
+        let interval = Duration::from_millis(lease);
+        let event = TimedEvent::periodic(interval, event);
+        // Get the handle of the periodic event
+        let ll_handle = event.get_handle();
+
+        // Event handles
+        let handles = vec![ka_handle, ll_handle];
+
+        // Channel for signal the termination of consume task
+        let (sender, receiver) = channel::<()>(1);
 
         // Spawn the consume task
         let c_queue = queue.clone();
         let c_link = link.clone();
         let c_active = active.clone();
+        let c_alive = alive.clone();
         let c_barrier = barrier.clone();
-        let c_handle = handle.clone();
+        let mut c_handles = handles.clone();
         task::spawn(async move {
             // Add the keep alive event to the timer
             timer.add(event).await;
             // Start
-            let res = consume_task(c_queue, c_link, c_active, c_barrier).await;
+            let res = consume_task(c_queue, c_link.clone(), c_active.clone(), receiver, c_barrier).await;
             if res.is_err() {
+                // Cleanup upon an error
                 c_active.store(false, Ordering::Relaxed);
-                c_handle.defuse();
+                c_alive.clear();
+                // Drain the timed events
+                for h in c_handles.drain(..) {
+                    h.defuse();
+                }
+                // Close the underlying link
+                let _ = c_link.close().await;          
             }
         });
 
@@ -112,8 +194,10 @@ impl ChannelLink {
             link,
             queue,
             active,
+            alive,
             barrier,
-            handle
+            handles,
+            signal: sender
         }
     }
 }
@@ -122,6 +206,11 @@ impl ChannelLink {
     #[inline]    
     pub(super) fn get_link(&self) -> &Link {
         &self.link
+    }
+
+    #[inline]    
+    pub(super) fn mark_alive(&self) {
+        self.alive.mark();
     }
 
     pub(super) async fn schedule_zenoh_message(&self, msg: ZenohMessage, priority: usize) {
@@ -136,11 +225,15 @@ impl ChannelLink {
         }
     }
 
-    pub(super) async fn close(self) -> ZResult<()> {
+    pub(super) async fn close(mut self) -> ZResult<()> {
         // Deactivate the consume task if active
         if self.active.swap(false, Ordering::Relaxed) {
-            // Defuse the keep alive event
-            self.handle.defuse();
+            // Send the signal
+            let _ = self.signal.try_send(());
+            // Defuse the timed events
+            for h in self.handles.drain(..) {
+                h.defuse();
+            } 
             // Wait for the task to exit
             self.barrier.wait().await;
             // Close the underlying link

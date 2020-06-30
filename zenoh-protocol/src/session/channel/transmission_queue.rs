@@ -36,7 +36,7 @@ use zenoh_util::sync::Condition;
 
 
 struct CircularBatchIn {
-    index: usize,
+    priority: usize,
     batch_size: usize,
     inner: VecDeque<SerializationBatch>,
     sn_reliable: Arc<Mutex<SeqNumGenerator>>,
@@ -55,7 +55,7 @@ macro_rules! zrefill {
             // Drop the guard and wait for the batches to be available
             $batch.not_full.wait(empty_guard).await;
             // We have been notified that there are batches available:
-            // reacquire the lock
+            // reacquire the lock on the state_empty
             empty_guard = zasynclock!($batch.state_empty);
         }
         // Drain all the empty batches
@@ -68,7 +68,7 @@ macro_rules! zrefill {
 
 impl CircularBatchIn {
     fn new(
-        index: usize,
+        priority: usize,
         capacity: usize,
         batch_size: usize,
         is_streamed: bool,
@@ -87,7 +87,7 @@ impl CircularBatchIn {
         }
 
         CircularBatchIn {
-            index,
+            priority,
             batch_size,
             inner,
             sn_reliable,
@@ -118,6 +118,13 @@ impl CircularBatchIn {
     async fn serialize_session_message(&mut self, message: SessionMessage) { 
         // Attempt the serialization on the current batch
         if self.try_serialize_session_message(&message).await {
+            // Notify if needed
+            if self.not_empty.has_waiting_list() {
+                let batch = self.inner.pop_front().unwrap();
+                let mut guard = zasynclock!(self.state_out);
+                guard[self.priority].push(batch);
+                self.not_empty.notify(guard).await;
+            }
             return
         }
 
@@ -128,7 +135,7 @@ impl CircularBatchIn {
         if let Some(batch) = self.pull() {
             // The previous batch wasn't empty
             let mut guard = zasynclock!(self.state_out);
-            guard[self.index].push(batch);
+            guard[self.priority].push(batch);
             // Notify if needed
             if self.not_empty.has_waiting_list() {
                 self.not_empty.notify(guard).await;
@@ -159,7 +166,8 @@ impl CircularBatchIn {
         };
 
         // Fragment the whole message
-        while !wbuf.is_empty() {
+        let mut to_write = wbuf.len();
+        while to_write > 0 {
             // Get the current serialization batch
             let batch = if let Some(batch) = self.inner.front_mut() {
                 batch
@@ -169,18 +177,38 @@ impl CircularBatchIn {
                 continue
             };
 
-            let res = batch.serialize_zenoh_fragment(message.is_reliable(), guard.get(), &mut wbuf).await;
+            // Get the frame SN
+            let sn = guard.get();
 
-            if res {
-                // Move the serialization batch into the OUT pipeline
-                let batch = self.inner.pop_front().unwrap();
-                let mut guard = zasynclock!(self.state_out);
-                guard[self.index].push(batch);
-                // Notify if needed
-                if self.not_empty.has_waiting_list() {
-                    self.not_empty.notify(guard).await;
-                }
+            // Serialize the message
+            let (written, is_final) = batch.serialize_zenoh_fragment(
+                message.is_reliable(), sn, &mut wbuf, to_write
+            ).await;
+
+            // Update the amount of bytes left to write
+            to_write -= written;
+
+            // 0 bytes written means error
+            if written != 0 {
+                if is_final {
+                    if self.not_empty.has_waiting_list() {
+                        // Don't push the last batch which likely can hold more messages
+                        let out_guard = zasynclock!(self.state_out);
+                        self.not_empty.notify(out_guard).await;
+                    }
+                } else {
+                    // Move the serialization batch into the OUT pipeline
+                    let batch = self.inner.pop_front().unwrap();
+                    let mut out_guard = zasynclock!(self.state_out);
+                    out_guard[self.priority].push(batch);
+                    // Notify if needed
+                    if self.not_empty.has_waiting_list() {
+                        self.not_empty.notify(out_guard).await;
+                    }
+                }   
             } else {
+                // Reinsert the SN back to the pool
+                guard.set(sn);
                 log::warn!("Zenoh message dropped because it can not be fragmented: {:?}", message);
                 break
             }
@@ -210,7 +238,7 @@ impl CircularBatchIn {
             if self.not_empty.has_waiting_list() {
                 let batch = self.inner.pop_front().unwrap();
                 let mut guard = zasynclock!(self.state_out);
-                guard[self.index].push(batch);
+                guard[self.priority].push(batch);
                 self.not_empty.notify(guard).await;
             }
             return
@@ -224,7 +252,7 @@ impl CircularBatchIn {
         if let Some(batch) = self.pull() {
             // The previous batch wasn't empty
             let mut guard = zasynclock!(self.state_out);
-            guard[self.index].push(batch);
+            guard[self.priority].push(batch);
             // Notify if needed
             if self.not_empty.has_waiting_list() {
                 self.not_empty.notify(guard).await;
@@ -255,29 +283,42 @@ impl CircularBatchIn {
 }
 
 struct CircularBatchOut {
-    inner: VecDeque<SerializationBatch>
+    inner: VecDeque<SerializationBatch>,
+    state_in: Option<Arc<Mutex<CircularBatchIn>>>
 }
 
 impl CircularBatchOut {
     fn new(capacity: usize) -> CircularBatchOut {
         CircularBatchOut {
-            inner: VecDeque::<SerializationBatch>::with_capacity(capacity)
+            inner: VecDeque::<SerializationBatch>::with_capacity(capacity),
+            state_in: None
         }
     }
     
+    fn initialize(&mut self, state_in: Arc<Mutex<CircularBatchIn>>) {
+        self.state_in = Some(state_in);
+    }
+
     #[inline]
-    pub(crate) fn push(&mut self, mut batch: SerializationBatch) {
+    fn push(&mut self, mut batch: SerializationBatch) {
         batch.write_len();
         self.inner.push_back(batch);        
     }
 
-    pub(crate) fn pull(&mut self) -> Option<SerializationBatch> {
-        self.inner.pop_front()    
-    }
-
-    #[inline]
-    fn is_empty(&self) -> bool {
-        self.inner.is_empty()
+    fn pull(&mut self) -> Option<SerializationBatch> {
+        if let Some(batch) = self.inner.pop_front() {
+            return Some(batch)
+        } else {
+            // Check if an incomplete (non-empty) batch is available in the state IN pipeline.            
+            let state_in = self.state_in.as_ref().unwrap();            
+            if let Some(mut guard) = state_in.try_lock() {
+                if let Some(batch) = guard.pull() {
+                    // Send the incomplete batch
+                    return Some(batch)
+                }
+            }
+        }     
+        None
     }
 }
 
@@ -310,7 +351,7 @@ impl CircularBatchEmpty {
 }
 
 /// Link queue
-pub struct LinkQueue {
+pub struct TransmissionQueue {
     // Each priority queue has its own Mutex
     state_in: Vec<Arc<Mutex<CircularBatchIn>>>,
     // Each priority queue has its own Mutex
@@ -325,14 +366,14 @@ pub struct LinkQueue {
     not_empty: Arc<Condition>
 }
 
-impl LinkQueue {
+impl TransmissionQueue {
     /// Create a new link queue.
     pub fn new(
         batch_size: usize,
         is_streamed: bool,
         sn_reliable: Arc<Mutex<SeqNumGenerator>>,
         sn_best_effort: Arc<Mutex<SeqNumGenerator>>
-    ) -> LinkQueue {
+    ) -> TransmissionQueue {
         // Conditional variables        
         let not_full = vec![Arc::new(Condition::new(*QUEUE_CONCURRENCY)); QUEUE_NUM];
         let not_empty = Arc::new(Condition::new(*QUEUE_CONCURRENCY));
@@ -367,8 +408,15 @@ impl LinkQueue {
             sn_best_effort.clone(), state_out.clone(), state_empty[QUEUE_PRIO_DATA].clone(), 
             not_full[QUEUE_PRIO_DATA].clone(), not_empty.clone()
         ))));
+
+        // Initialize the state OUT
+        let mut guard = state_out.try_lock().unwrap();
+        guard[QUEUE_PRIO_CTRL].initialize(state_in[QUEUE_PRIO_CTRL].clone());
+        guard[QUEUE_PRIO_RETX].initialize(state_in[QUEUE_PRIO_RETX].clone());
+        guard[QUEUE_PRIO_DATA].initialize(state_in[QUEUE_PRIO_DATA].clone());
+        drop(guard);
          
-        LinkQueue { 
+        TransmissionQueue { 
             state_in,
             state_out,
             state_empty,            
@@ -436,18 +484,19 @@ mod tests {
 
     use crate::core::ResKey;
     use crate::io::RBuf;
-    use crate::proto::{SeqNumGenerator, SessionMessage, ZenohMessage};
-    use crate::session::defaults::{QUEUE_PRIO_CTRL, QUEUE_PRIO_RETX, QUEUE_PRIO_DATA, SESSION_BATCH_SIZE, SESSION_SEQ_NUM_RESOLUTION};
+    use crate::proto::{SeqNumGenerator, ZenohMessage};
+    use crate::session::defaults::{QUEUE_PRIO_DATA, SESSION_BATCH_SIZE, SESSION_SEQ_NUM_RESOLUTION};
 
     use super::*;
 
+    const NUM_MSG: usize = 10_000_000;
 
-    async fn schedule(queue: Arc<LinkQueue>, counter: Arc<AtomicUsize>) {
+    async fn schedule(payload_size: usize, queue: Arc<TransmissionQueue>, counter: Arc<AtomicUsize>) {
         // Send reliable messages
         let reliable = true;
         let key = ResKey::RName("test".to_string());
         let info = None;
-        let payload = RBuf::from(vec![0u8; 8_000]);
+        let payload = RBuf::from(vec![0u8; payload_size]);
         let reply_context = None;
         let attachment = None;
 
@@ -455,31 +504,45 @@ mod tests {
             reliable, key, info, payload, reply_context, attachment
         );
 
-        loop {
+        println!(">>> Sending {} messages with payload size: {}", NUM_MSG, payload_size);
+        for _ in 0..NUM_MSG {
             queue.push_zenoh_message(message.clone(), QUEUE_PRIO_DATA).await;
             counter.fetch_add(1, Ordering::Relaxed);
         }
+        println!(">>> Done sending {} with payload size: {}", NUM_MSG, payload_size);
     }
 
-    async fn consume(queue: Arc<LinkQueue>, counter: Arc<AtomicUsize>) {
+    async fn consume(queue: Arc<TransmissionQueue>, c_batches: Arc<AtomicUsize>, c_bytes: Arc<AtomicUsize>) {
         loop {
-            let (batch, index) = queue.pull().await;
-            counter.fetch_add(batch.len(), Ordering::Relaxed);   
-            queue.push_serialization_batch(batch, index).await;
-        }        
+            let (batch, priority) = queue.pull().await;
+            c_batches.fetch_add(1, Ordering::Relaxed);
+            c_bytes.fetch_add(batch.len(), Ordering::Relaxed);   
+            queue.push_serialization_batch(batch, priority).await;
+        }     
     }
 
-    async fn stats(c_messages: Arc<AtomicUsize>, c_bytes: Arc<AtomicUsize>) {
+    async fn stats(
+        c_payload: Arc<AtomicUsize>, 
+        c_messages: Arc<AtomicUsize>, 
+        c_batches: Arc<AtomicUsize>, 
+        c_bytes: Arc<AtomicUsize>
+    ) {
         loop {
             task::sleep(Duration::from_millis(1_000)).await;
+            let payload = c_payload.load(Ordering::Relaxed);
             let messages = c_messages.swap(0, Ordering::Relaxed);
+            let batches = c_batches.swap(0, Ordering::Relaxed);
             let bytes = c_bytes.swap(0, Ordering::Relaxed);
-            println!("Messages: {}\tBytes: {}", messages, bytes);
+            let throughput = 8*bytes/1_000_000;
+            println!("Payload: {}\t\tMessages: {}\t\tBatches: {}\t\tBytes: {}\t\tThroughput: {} Mbps", 
+                        payload, messages, batches, bytes, throughput);
         }
     }
 
     #[test]
-    fn link_queue() {
+    #[ignore]
+    fn transmission_queue_throughput() {
+        // Queue
         let batch_size = *SESSION_BATCH_SIZE;
         let is_streamed = true;
         let sn_reliable = Arc::new(Mutex::new(
@@ -488,24 +551,36 @@ mod tests {
         let sn_best_effort = Arc::new(Mutex::new(
             SeqNumGenerator::new(0, *SESSION_SEQ_NUM_RESOLUTION)
         ));
-
-        let queue = Arc::new(LinkQueue::new(
+        let queue = Arc::new(TransmissionQueue::new(
             batch_size, is_streamed, sn_reliable, sn_best_effort
         ));
+
+        // Counters
+        let payload_size = Arc::new(AtomicUsize::new(0));
         let counter_messages = Arc::new(AtomicUsize::new(0));
+        let counter_batches = Arc::new(AtomicUsize::new(0));
         let counter_bytes = Arc::new(AtomicUsize::new(0));
 
-        let c_messages = counter_messages.clone();
+        // Tasks
+        let c_queue = queue.clone();
+        let c_batches = counter_batches.clone();
         let c_bytes = counter_bytes.clone();
         task::spawn(async move {
-            stats(c_messages, c_bytes).await;
+            consume(c_queue, c_batches, c_bytes).await;
         });
 
-        let c_queue = queue.clone();
+        let c_payload = payload_size.clone();
+        let c_messages = counter_messages.clone();
+        let c_batches = counter_batches.clone();
+        let c_bytes = counter_bytes.clone();
         task::spawn(async move {
-            consume(c_queue, counter_bytes).await;
+            stats(c_payload, c_messages, c_batches, c_bytes).await;
         });
-
-        task::block_on(schedule(queue, counter_messages));
-    }    
+        
+        // for ps in [64, 256, 1024, 8_100, 16_384, 32_768, 65_536, 10_000_000].iter() {
+        for ps in [10_000_000].iter() {  
+            payload_size.store(*ps, Ordering::Relaxed);                 
+            task::block_on(schedule(*ps, queue.clone(), counter_messages.clone()));            
+        }
+    }
 }

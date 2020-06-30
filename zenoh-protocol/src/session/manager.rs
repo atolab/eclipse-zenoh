@@ -584,13 +584,6 @@ impl Session {
         channel.schedule(message, link).await;
         Ok(())
     }
-
-    pub async fn schedule_batch(&self, messages: Vec<ZenohMessage>, link: Option<Link>) -> ZResult<()> {
-        log::trace!("{:?}. Schedule batch: {:?}", self, messages);
-        let channel = zweak!(self.0, STR_ERR);
-        channel.schedule_batch(messages, link).await;
-        Ok(())
-    }
 }
 
 #[async_trait]

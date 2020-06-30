@@ -13,29 +13,25 @@
 //
 use async_std::sync::{Arc, Weak};
 use async_trait::async_trait;
-use std::collections::HashSet;
-use std::iter::FromIterator;
 
-use super::{Channel, LinkQueue};
+use super::{Channel, LinkAlive, TransmissionQueue};
 
 use crate::link::Link;
 use crate::proto::{SessionMessage, smsg};
 use crate::session::defaults::QUEUE_PRIO_CTRL;
 
-use zenoh_util::zasynclock;
 use zenoh_util::collections::Timed;
 
 /*************************************/
-/*            KEEP ALIVE             */
+/*          LINK KEEP ALIVE          */
 /*************************************/
 pub(super) struct KeepAliveEvent {
-    queue: Arc<LinkQueue>,
-    #[cfg(debug_assertions)]
+    queue: Arc<TransmissionQueue>,
     link: Link
 }
 
 impl KeepAliveEvent {
-    pub(super) fn new(queue: Arc<LinkQueue>, link: Link) -> KeepAliveEvent {
+    pub(super) fn new(queue: Arc<TransmissionQueue>, link: Link) -> KeepAliveEvent {        
         KeepAliveEvent {
             queue,
             link
@@ -58,44 +54,71 @@ impl Timed for KeepAliveEvent {
 }
 
 /*************************************/
-/*          SESSION LEASE            */
+/*        LINK LEASE EVENT           */
 /*************************************/
-pub(super) struct LeaseEvent {
+pub(super) struct LinkLeaseEvent {
+    ch: Weak<Channel>,
+    alive: Arc<LinkAlive>,
+    link: Link
+}
+
+impl LinkLeaseEvent {
+    pub(super) fn new(ch: Weak<Channel>, alive: Arc<LinkAlive>, link: Link) -> LinkLeaseEvent {        
+        LinkLeaseEvent {
+            ch,
+            alive,
+            link
+        }
+    }
+}
+
+#[async_trait]
+impl Timed for LinkLeaseEvent {
+    async fn run(&mut self) {
+        log::trace!("Verify link lease: {}", self.link);
+        
+        if self.alive.get() {
+            self.alive.clear();
+        } else if let Some(ch) = self.ch.upgrade() {
+            let links = ch.get_links().await;
+            if links.len() == 1 && links[0] == self.link {
+                log::warn!("Session has expired with peer: {}", ch.get_peer());
+                // The last link has expired, close the whole session
+                let _ = ch.close(smsg::close_reason::EXPIRED).await;                
+            } else {
+                log::warn!("Link {} has expired with peer: {}", self.link, ch.get_peer());
+                // Close only the link
+                let _ = ch.close_link(&self.link, smsg::close_reason::EXPIRED).await;
+            }            
+        }
+    }
+}
+
+/*************************************/
+/*        SESSION LEASE EVENT        */
+/*************************************/
+pub(super) struct SessionLeaseEvent {
     ch: Weak<Channel>
 }
 
-impl LeaseEvent {
-    pub(super) fn new(ch: Weak<Channel>) -> LeaseEvent {
-        LeaseEvent {
+impl SessionLeaseEvent {
+    pub(super) fn new(ch: Weak<Channel>) -> SessionLeaseEvent {        
+        SessionLeaseEvent {
             ch
         }
     }
 }
 
 #[async_trait]
-impl Timed for LeaseEvent {
-    async fn run(&mut self) {        
+impl Timed for SessionLeaseEvent {
+    async fn run(&mut self) {
         if let Some(ch) = self.ch.upgrade() {
-            log::trace!("Verify session lease for peer: {}", ch.get_peer());
-
-            // Create the set of current links
-            let links: HashSet<Link> = HashSet::from_iter(ch.get_links().await.drain(..));
-            // Get and reset the current status of active links
-            let alive: HashSet<Link> = HashSet::from_iter(zasynclock!(ch.rx).alive.drain());
-            // Create the difference set
-            let mut difference: HashSet<Link> = HashSet::from_iter(links.difference(&alive).cloned());
-
-            if links == difference {
-                // We have no links left or all the links have expired: close the whole session
-                log::warn!("Session with peer {} has expired", ch.get_peer());                
-                let _ = ch.close(smsg::close_reason::EXPIRED).await;
-            } else {
-                // Remove only the links with expired lease
-                for l in difference.drain() {
-                    log::warn!("Link with peer {} has expired: {}", ch.get_peer(), l);
-                    let _ = ch.close_link(&l, smsg::close_reason::EXPIRED).await;                
-                }
-            }            
+            let links = ch.get_links().await;
+            if links.is_empty() {
+                log::warn!("Session has expired with peer: {}", ch.get_peer());
+                // The last link has expired, close the whole session
+                let _ = ch.delete().await;                
+            }         
         }
     }
 }

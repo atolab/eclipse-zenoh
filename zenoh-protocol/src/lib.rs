@@ -11,9 +11,6 @@
 // Contributors:
 //   ADLINK zenoh team, <zenoh@adlink-labs.tech>
 //
-#![feature(new_uninit)]
-#![feature(get_mut_unchecked)]
-
 #[macro_use]
 extern crate zenoh_util;
 #[macro_use]

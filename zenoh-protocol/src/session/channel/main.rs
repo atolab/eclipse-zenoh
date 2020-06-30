@@ -15,19 +15,30 @@ use async_std::sync::{Arc, Mutex, RwLock, Weak};
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::time::Duration;
 
-use super::{ChannelInnerRx, ChannelLink, LeaseEvent, ReliabilityQueue};
+use super::{ChannelLink, ChannelRxBestEffort, ChannelRxReliable, SessionLeaseEvent};
 
 use crate::core::{PeerId, ZInt};
 use crate::link::Link;
-use crate::io::WBuf;
-use crate::proto::{FramePayload, SeqNumGenerator, SessionMessage, WhatAmI, ZenohMessage};
+use crate::proto::{SeqNumGenerator, SessionMessage, WhatAmI, ZenohMessage};
 use crate::session::{MsgHandler, SessionManagerInner};
-use crate::session::defaults::{QUEUE_PRIO_CTRL, QUEUE_PRIO_DATA};
+use crate::session::defaults::QUEUE_PRIO_DATA;
 
-use zenoh_util::{zasynclock, zasyncread, zasyncwrite};
-use zenoh_util::collections::{CreditBuffer, CreditQueue, TimedEvent, Timer};
-use zenoh_util::core::ZResult;
+use zenoh_util::{zasyncread, zasyncwrite, zerror, zasyncopt};
+use zenoh_util::collections::{TimedEvent, Timer};
+use zenoh_util::core::{ZError, ZErrorKind, ZResult};
 
+
+macro_rules! zlinkget {
+    ($guard:expr, $link:expr) => {
+        $guard.iter().find(|l| l.get_link() == $link)
+    };
+}
+
+macro_rules! zlinkindex {
+    ($guard:expr, $link:expr) => {
+        $guard.iter().position(|l| l.get_link() == $link)
+    };
+}
 
 /*************************************/
 /*           CHANNEL STRUCT          */
@@ -49,16 +60,20 @@ pub(crate) struct Channel {
     pub(super) batch_size: usize,
     // The callback has been set or not
     pub(super) has_callback: AtomicBool,
-    // The sn generator for the reliable channel
-    pub(super) sn_reliable: Arc<Mutex<SeqNumGenerator>>,
-    // The sn generator for the best_effort channel
-    pub(super) sn_best_effort: Arc<Mutex<SeqNumGenerator>>,
+    // The sn generator for the TX reliable channel
+    pub(super) tx_sn_reliable: Arc<Mutex<SeqNumGenerator>>,
+    // The sn generator for the TX best_effort channel
+    pub(super) tx_sn_best_effort: Arc<Mutex<SeqNumGenerator>>,
+    // The RX reliable channel
+    pub(super) rx_reliable: Mutex<ChannelRxReliable>,
+    // The RX best effort channel
+    pub(super) rx_best_effort: Mutex<ChannelRxBestEffort>,
     // The links associated to the channel
     pub(super) links: Arc<RwLock<Vec<ChannelLink>>>,
-    // The mutable data struct for reception
-    pub(super) rx: Mutex<ChannelInnerRx>,
     // The internal timer
     pub(super) timer: Timer,
+    // The callback
+    pub(super) callback: RwLock<Option<Arc<dyn MsgHandler + Send + Sync>>>,
     // Weak reference to self
     pub(super) w_self: RwLock<Option<Weak<Self>>>
 }
@@ -85,11 +100,13 @@ impl Channel {
             sn_resolution,
             batch_size,
             has_callback: AtomicBool::new(false),
-            sn_reliable: Arc::new(Mutex::new(SeqNumGenerator::new(initial_sn_tx, sn_resolution))),
-            sn_best_effort: Arc::new(Mutex::new(SeqNumGenerator::new(initial_sn_tx, sn_resolution))),
+            tx_sn_reliable: Arc::new(Mutex::new(SeqNumGenerator::new(initial_sn_tx, sn_resolution))),
+            tx_sn_best_effort: Arc::new(Mutex::new(SeqNumGenerator::new(initial_sn_tx, sn_resolution))),            
+            rx_reliable: Mutex::new(ChannelRxReliable::new(sn_resolution, initial_sn_rx)),
+            rx_best_effort: Mutex::new(ChannelRxBestEffort::new(sn_resolution, initial_sn_rx)),
             links: Arc::new(RwLock::new(Vec::new())),
-            rx: Mutex::new(ChannelInnerRx::new(sn_resolution, initial_sn_rx)),
             timer: Timer::new(),
+            callback: RwLock::new(None),
             w_self: RwLock::new(None)
         }        
     }
@@ -97,10 +114,12 @@ impl Channel {
     pub(crate) async fn initialize(&self, w_self: Weak<Self>) {
         // Initialize the weak reference to self
         *zasyncwrite!(self.w_self) = Some(w_self.clone());
-        // Initialize the lease event
-        let event = LeaseEvent::new(w_self);
+        // Lease event
+        let event = SessionLeaseEvent::new(w_self);
+        // Keep alive interval is expressed in milliseconds
         let interval = Duration::from_millis(self.lease);
         let event = TimedEvent::periodic(interval, event);
+        // Add the event to the timer
         self.timer.add(event).await;
     }
 
@@ -133,44 +152,33 @@ impl Channel {
     }
 
     pub(crate) async fn set_callback(&self, callback: Arc<dyn MsgHandler + Send + Sync>) {        
-        let mut guard = zasynclock!(self.rx);
+        let mut guard = zasyncwrite!(self.callback);
+        *guard = Some(callback.clone());
         self.has_callback.store(true, Ordering::Relaxed);
-        guard.callback = Some(callback);
     }
 
     /*************************************/
     /*           TERMINATION             */
     /*************************************/
     pub(super) async fn delete(&self) {
-        // // Stop the consume task with the lowest priority to give enough
-        // // time to send all the messages still present in the queue
-        // let res = self.stop(*QUEUE_PRIO_DATA).await;
-        // log::trace!("Delete: {:?}", res);
+        // Delete the session on the manager
+        let _ = self.manager.del_session(&self.pid).await;            
 
-        // // Delete the session on the manager
-        // let _ = self.manager.del_session(&self.pid).await;            
-
-        // // Notify the callback
-        // if let Some(callback) = &zasynclock!(self.rx).callback {
-        //     callback.close().await;
-        // }
+        // Notify the callback
+        zasyncopt!(self.callback).close().await;
         
-        // // Close all the links
-        // // NOTE: del_link() is meant to be used thorughout the lifetime
-        // //       of the session and not for its termination.
-        // for l in self.get_links().await.drain(..) {
-        //     let _ = l.close().await;
-        // }
-
-        // // Remove all the reference to the links
-        // zasyncwrite!(self.links).clear();
+        // Close all the links
+        let mut guard = zasyncwrite!(self.links);
+        for l in guard.drain(..) {
+            let _ = l.close().await;
+        }
     }
 
     pub(crate) async fn close_link(&self, link: &Link, reason: u8) -> ZResult<()> {     
         log::trace!("Closing link {} with peer: {}", link, self.get_peer());
 
         let guard = zasyncread!(self.links);
-        if let Some(l) = guard.iter().find(|l| l.get_link() == link) {
+        if let Some(l) = zlinkget!(guard, link) {
             // Close message to be sent on the target link
             let peer_id = Some(self.manager.config.pid.clone());
             let reason_id = reason;              
@@ -183,7 +191,7 @@ impl Channel {
 
             // Drop the guard
             drop(guard);
-            
+
             // Remove the link from the channel
             self.del_link(&link).await?;
         }
@@ -194,9 +202,6 @@ impl Channel {
     pub(crate) async fn close(&self, reason: u8) -> ZResult<()> {
         log::trace!("Closing session with peer: {}", self.get_peer());
 
-        // Atomically push the messages on the queue
-        let mut messages: Vec<MessageTx> = Vec::new();
-
         // Close message to be sent on all the links
         let peer_id = Some(self.manager.config.pid.clone());
         let reason_id = reason;              
@@ -204,16 +209,10 @@ impl Channel {
         let attachment = None;  // No attachment here
         let msg = SessionMessage::make_close(peer_id, reason_id, link_only, attachment);
 
-        for link in self.get_links().await.drain(..) {
-            let close = MessageTx {
-                inner: MessageInner::Session(msg.clone()),
-                link: Some(link)
-            };
-            messages.push(close);
+        let mut links = zasyncread!(self.links).clone();
+        for link in links.drain(..) {
+            link.schedule_session_message(msg.clone(), QUEUE_PRIO_DATA).await;
         }
-
-        // Atomically push the close and stop messages to the queue
-        self.queue.push_batch(messages, *QUEUE_PRIO_DATA).await;
 
         // Terminate and clean up the session
         self.delete().await;
@@ -226,69 +225,61 @@ impl Channel {
     /*************************************/
     /// Schedule a Zenoh message on the transmission queue
     pub(crate) async fn schedule(&self, message: ZenohMessage, link: Option<Link>) {
-        let message = MessageTx {
-            inner: MessageInner::Zenoh(message),
-            link
-        };
-        // Wait for the queue to have space for the message
-        self.queue.push(message, *QUEUE_PRIO_DATA).await;
-    }
-
-    /// Schedule a batch of Zenoh messages on the transmission queue
-    pub(crate) async fn schedule_batch(&self, mut messages: Vec<ZenohMessage>, link: Option<Link>) {
-        let messages = messages.drain(..).map(|x| {
-            MessageTx {
-                inner: MessageInner::Zenoh(x),
-                link: link.clone(),
+        if let Some(link) = link {
+            let guard = zasyncread!(self.links);
+            if let Some(l) = zlinkget!(guard, &link) {
+                l.schedule_zenoh_message(message, QUEUE_PRIO_DATA).await;
+            } else {
+                log::warn!("Zenoh message has been dropped because link {} does not exist\
+                            in session with peer {}: {}", link, self.get_peer(), message);
             }
-        }).collect();
-        // Wait for the queue to have space for the message
-        self.queue.push_batch(messages, *QUEUE_PRIO_DATA).await;        
+        } else {
+            let guard = zasyncread!(self.links);
+            if guard.is_empty() {                
+                log::warn!("Zenoh message has been dropped because session with peer {} has no links: {}", self.get_peer(), message);
+            } else {
+                guard[0].schedule_zenoh_message(message, QUEUE_PRIO_DATA).await;
+            }
+        }
     }
 
     /*************************************/
     /*               LINK                */
     /*************************************/    
     pub(crate) async fn add_link(&self, link: Link) -> ZResult<()> {
+        let mut guard = zasyncwrite!(self.links);
+        if zlinkget!(guard, &link).is_some() {
+            return zerror!(ZErrorKind::InvalidLink { 
+                descr: format!("Can not add Link {} with peer: {}", link, self.get_peer())
+            });
+        }
+
         // Create a channel link from a link
         let link = ChannelLink::new(
-            link, self.batch_size, self.keep_alive,
-            self.sn_reliable.clone(), self.sn_best_effort.clone(), self.timer.clone()
+            zasyncopt!(self.w_self).clone(), link, self.batch_size, self.keep_alive, self.lease,
+            self.tx_sn_reliable.clone(), self.tx_sn_best_effort.clone(), self.timer.clone()
         );
 
-        // // Add the link along with the handle for defusing the KEEP_ALIVE messages
-        // zasyncwrite!(self.links).add(link.clone(), handle)?;
-
-        // // Add the link to the set of alive links
-        // zasynclock!(self.rx).alive.insert(link);
+        // Add the link to the channel
+        guard.push(link);
         
         Ok(())
     }
 
     pub(crate) async fn del_link(&self, link: &Link) -> ZResult<()> { 
-        // // Try to remove the link
-        // let mut guard = zasyncwrite!(self.links);
-        // let handle = guard.del(link)?;
-        // let is_empty = guard.links.is_empty();
-        // // Drop the guard before doing any other operation
-        // drop(guard);
-        
-        // // Defuse the periodic sending of KEEP_ALIVE messages on this link
-        // handle.defuse();
-                
-        // // Stop the consume task to get the updated view on the links
-        // let _ = self.stop(*QUEUE_PRIO_CTRL).await;
-        // // Don't restart the consume task if there are no links left
-        // if !is_empty {
-        //     // Start the consume task with the new view on the links
-        //     let _ = self.start().await;
-        // }
-
-        Ok(())    
+        // Try to remove the link
+        let mut guard = zasyncwrite!(self.links);
+        if let Some(index) = zlinkindex!(guard, link) {
+            let link = guard.remove(index);
+            link.close().await
+        } else {
+            zerror!(ZErrorKind::InvalidLink { 
+                descr: format!("Can not delete Link {} with peer: {}", link, self.get_peer())
+            })
+        }
     }
 
     pub(crate) async fn get_links(&self) -> Vec<Link> {
-        // zasyncread!(self.links).get()
-        Vec::new()
+        zasyncread!(self.links).iter().map(|l| l.get_link().clone()).collect()
     }
 }
