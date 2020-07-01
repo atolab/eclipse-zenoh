@@ -116,17 +116,22 @@ impl CircularBatchIn {
     }
     
     async fn serialize_session_message(&mut self, message: SessionMessage) { 
-        // Attempt the serialization on the current batch
-        if self.try_serialize_session_message(&message).await {
-            // Notify if needed
-            if self.not_empty.has_waiting_list() {
-                let batch = self.inner.pop_front().unwrap();
-                let mut guard = zasynclock!(self.state_out);
-                guard[self.priority].push(batch);
-                self.not_empty.notify(guard).await;
-            }
-            return
+        macro_rules! zserialize {
+            ($message:expr) => {
+                if self.try_serialize_session_message($message).await {
+                    // Notify if needed
+                    if self.not_empty.has_waiting_list() {
+                        let batch = self.inner.pop_front().unwrap();
+                        let mut guard = zasynclock!(self.state_out);
+                        guard[self.priority].push(batch);
+                        self.not_empty.notify(guard).await;
+                    }
+                    return
+                }
+            };
         }
+        // Attempt the serialization on the current batch
+        zserialize!(&message);
 
         // The first serialization attempt has failed. This means that the current
         // batch is full. Therefore:
@@ -144,9 +149,7 @@ impl CircularBatchIn {
             }
 
             // Attempt the serialization on a new empty batch
-            if self.try_serialize_session_message(&message).await {
-                return
-            }
+            zserialize!(&message);
         }
 
         log::warn!("Session message dropped because it can not be fragmented: {:?}", message);
@@ -181,7 +184,7 @@ impl CircularBatchIn {
             let sn = guard.get();
 
             // Serialize the message
-            let (written, is_final) = batch.serialize_zenoh_fragment(
+            let written = batch.serialize_zenoh_fragment(
                 message.is_reliable(), sn, &mut wbuf, to_write
             ).await;
 
@@ -190,22 +193,14 @@ impl CircularBatchIn {
 
             // 0 bytes written means error
             if written != 0 {
-                if is_final {
-                    if self.not_empty.has_waiting_list() {
-                        // Don't push the last batch which likely can hold more messages
-                        let out_guard = zasynclock!(self.state_out);
-                        self.not_empty.notify(out_guard).await;
-                    }
-                } else {
-                    // Move the serialization batch into the OUT pipeline
-                    let batch = self.inner.pop_front().unwrap();
-                    let mut out_guard = zasynclock!(self.state_out);
-                    out_guard[self.priority].push(batch);
-                    // Notify if needed
-                    if self.not_empty.has_waiting_list() {
-                        self.not_empty.notify(out_guard).await;
-                    }
-                }   
+                // Move the serialization batch into the OUT pipeline
+                let batch = self.inner.pop_front().unwrap();
+                let mut out_guard = zasynclock!(self.state_out);
+                out_guard[self.priority].push(batch);
+                // Notify if needed
+                if self.not_empty.has_waiting_list() {
+                    self.not_empty.notify(out_guard).await;
+                }
             } else {
                 // Reinsert the SN back to the pool
                 guard.set(sn);
@@ -232,17 +227,23 @@ impl CircularBatchIn {
     }
 
     async fn serialize_zenoh_message(&mut self, message: ZenohMessage) { 
-        // Attempt the serialization on the current batch
-        if self.try_serialize_zenoh_message(&message).await {
-            // Notify if needed
-            if self.not_empty.has_waiting_list() {
-                let batch = self.inner.pop_front().unwrap();
-                let mut guard = zasynclock!(self.state_out);
-                guard[self.priority].push(batch);
-                self.not_empty.notify(guard).await;
-            }
-            return
+        macro_rules! zserialize {
+            ($message:expr) => {
+                if self.try_serialize_zenoh_message(&message).await {
+                    // Notify if needed
+                    if self.not_empty.has_waiting_list() {
+                        let batch = self.inner.pop_front().unwrap();
+                        let mut guard = zasynclock!(self.state_out);
+                        guard[self.priority].push(batch);
+                        self.not_empty.notify(guard).await;
+                    }
+                    return
+                }
+            };
         }
+
+        // Attempt the serialization on the current batch
+        zserialize!(&message);
 
         // The first serialization attempt has failed. This means that the current
         // batch is either full or the message is too large. In case of the former,
@@ -261,9 +262,7 @@ impl CircularBatchIn {
             }
 
             // Attempt the serialization on a new empty batch
-            if self.try_serialize_zenoh_message(&message).await {
-                return
-            }
+            zserialize!(&message);
         }
 
         // The second serialization attempt has failed. This means that the message is 
@@ -300,19 +299,19 @@ impl CircularBatchOut {
     }
 
     #[inline]
-    fn push(&mut self, mut batch: SerializationBatch) {
-        batch.write_len();
+    fn push(&mut self, batch: SerializationBatch) {        
         self.inner.push_back(batch);        
     }
 
     fn pull(&mut self) -> Option<SerializationBatch> {
-        if let Some(batch) = self.inner.pop_front() {
+        if let Some(mut batch) = self.inner.pop_front() {
+            batch.write_len();
             return Some(batch)
         } else {
             // Check if an incomplete (non-empty) batch is available in the state IN pipeline.            
-            let state_in = self.state_in.as_ref().unwrap();            
-            if let Some(mut guard) = state_in.try_lock() {
-                if let Some(batch) = guard.pull() {
+            if let Some(mut guard) = self.state_in.as_ref().unwrap().try_lock() {
+                if let Some(mut batch) = guard.pull() {
+                    batch.write_len();
                     // Send the incomplete batch
                     return Some(batch)
                 }
@@ -484,64 +483,175 @@ mod tests {
 
     use crate::core::ResKey;
     use crate::io::RBuf;
-    use crate::proto::{SeqNumGenerator, ZenohMessage};
+    use crate::proto::{FramePayload, SeqNumGenerator, SessionBody, ZenohMessage};
     use crate::session::defaults::{QUEUE_PRIO_DATA, SESSION_BATCH_SIZE, SESSION_SEQ_NUM_RESOLUTION};
 
     use super::*;
 
-    const NUM_MSG: usize = 10_000_000;
+    #[test]
+    fn transmission_queue() {        
+        async fn schedule(
+            num_msg: usize,
+            payload_size: usize,
+            queue: Arc<TransmissionQueue>
+        ) {
+            // Send reliable messages
+            let reliable = true;
+            let key = ResKey::RName("test".to_string());
+            let info = None;
+            let payload = RBuf::from(vec![0u8; payload_size]);
+            let reply_context = None;
+            let attachment = None;
 
-    async fn schedule(payload_size: usize, queue: Arc<TransmissionQueue>, counter: Arc<AtomicUsize>) {
-        // Send reliable messages
-        let reliable = true;
-        let key = ResKey::RName("test".to_string());
-        let info = None;
-        let payload = RBuf::from(vec![0u8; payload_size]);
-        let reply_context = None;
-        let attachment = None;
-
-        let message = ZenohMessage::make_data(
-            reliable, key, info, payload, reply_context, attachment
-        );
-
-        println!(">>> Sending {} messages with payload size: {}", NUM_MSG, payload_size);
-        for _ in 0..NUM_MSG {
-            queue.push_zenoh_message(message.clone(), QUEUE_PRIO_DATA).await;
-            counter.fetch_add(1, Ordering::Relaxed);
+            let message = ZenohMessage::make_data(
+                reliable, key, info, payload, reply_context, attachment
+            );
+            
+            for _ in 0..num_msg {
+                queue.push_zenoh_message(message.clone(), QUEUE_PRIO_DATA).await;
+            }            
         }
-        println!(">>> Done sending {} with payload size: {}", NUM_MSG, payload_size);
-    }
 
-    async fn consume(queue: Arc<TransmissionQueue>, c_batches: Arc<AtomicUsize>, c_bytes: Arc<AtomicUsize>) {
-        loop {
-            let (batch, priority) = queue.pull().await;
-            c_batches.fetch_add(1, Ordering::Relaxed);
-            c_bytes.fetch_add(batch.len(), Ordering::Relaxed);   
-            queue.push_serialization_batch(batch, priority).await;
-        }     
-    }
-
-    async fn stats(
-        c_payload: Arc<AtomicUsize>, 
-        c_messages: Arc<AtomicUsize>, 
-        c_batches: Arc<AtomicUsize>, 
-        c_bytes: Arc<AtomicUsize>
-    ) {
-        loop {
-            task::sleep(Duration::from_millis(1_000)).await;
-            let payload = c_payload.load(Ordering::Relaxed);
-            let messages = c_messages.swap(0, Ordering::Relaxed);
-            let batches = c_batches.swap(0, Ordering::Relaxed);
-            let bytes = c_bytes.swap(0, Ordering::Relaxed);
-            let throughput = 8*bytes/1_000_000;
-            println!("Payload: {}\t\tMessages: {}\t\tBatches: {}\t\tBytes: {}\t\tThroughput: {} Mbps", 
-                        payload, messages, batches, bytes, throughput);
+        async fn consume(
+            queue: Arc<TransmissionQueue>, 
+            c_batches: Arc<AtomicUsize>, 
+            c_bytes: Arc<AtomicUsize>, 
+            c_messages: Arc<AtomicUsize>,
+            c_fragments: Arc<AtomicUsize>
+        ) {
+            loop {
+                let (batch, priority) = queue.pull().await;   
+                c_batches.fetch_add(1, Ordering::Relaxed);
+                c_bytes.fetch_add(batch.len(), Ordering::Relaxed);           
+                // Create a RBuf for deserialization starting from the batch
+                let mut rbuf: RBuf = batch.get_serialized_messages().into();
+                // Deserialize the messages
+                while let Ok(msg) = rbuf.read_session_message() {
+                    match msg.body {
+                        SessionBody::Frame { payload, .. } => match payload {
+                            FramePayload::Messages { messages } => {
+                                c_messages.fetch_add(messages.len(), Ordering::Relaxed);
+                            },
+                            FramePayload::Fragment { is_final, .. } => {
+                                c_fragments.fetch_add(1, Ordering::Relaxed);
+                                if is_final {
+                                    c_messages.fetch_add(1, Ordering::Relaxed);
+                                }
+                            }
+                        },
+                        _ => { c_messages.fetch_add(1, Ordering::Relaxed); }
+                    }                 
+                }
+                // Reinsert the batch
+                queue.push_serialization_batch(batch, priority).await;
+            }     
         }
+
+        // Queue
+        let batch_size = *SESSION_BATCH_SIZE;
+        let is_streamed = true;
+        let sn_reliable = Arc::new(Mutex::new(
+            SeqNumGenerator::new(0, *SESSION_SEQ_NUM_RESOLUTION)
+        ));
+        let sn_best_effort = Arc::new(Mutex::new(
+            SeqNumGenerator::new(0, *SESSION_SEQ_NUM_RESOLUTION)
+        ));
+        let queue = Arc::new(TransmissionQueue::new(
+            batch_size, is_streamed, sn_reliable, sn_best_effort
+        ));       
+
+        // Counters
+        let counter_batches = Arc::new(AtomicUsize::new(0));
+        let counter_bytes = Arc::new(AtomicUsize::new(0));
+        let counter_messages = Arc::new(AtomicUsize::new(0));
+        let counter_fragments = Arc::new(AtomicUsize::new(0));
+
+        // Consume task
+        let c_queue = queue.clone();
+        let c_batches = counter_batches.clone();
+        let c_bytes = counter_bytes.clone();
+        let c_messages = counter_messages.clone();
+        let c_fragments = counter_fragments.clone();
+        task::spawn(async move {
+            consume(c_queue, c_batches, c_bytes, c_messages, c_fragments).await;
+        });
+                
+        // Total amount of bytes to send in each test
+        let bytes: usize = 100_000_000;
+        // Paylod size of the messages
+        let payload_sizes = [8, 64, 512, 4_096, 8_192, 32_768, 262_144, 2_097_152];
+        // Sleep time for reading the number of received messages after scheduling completion
+        let sleep = Duration::from_millis(1_000);
+        task::block_on(async {
+            for ps in payload_sizes.iter() {                
+                let num_msg = bytes / ps;     
+                println!(">>> Sending {} messages with payload size: {}", num_msg, ps);                      
+                schedule(num_msg, *ps, queue.clone()).await;
+                task::sleep(sleep).await;  
+
+                let messages = counter_messages.swap(0, Ordering::Relaxed);
+                let batches = counter_batches.swap(0, Ordering::Relaxed);
+                let bytes = counter_bytes.swap(0, Ordering::Relaxed);    
+                let fragments = counter_fragments.swap(0, Ordering::Relaxed);            
+                println!("    Received {} messages, {} bytes, {} batches, {} fragments", messages, bytes, batches, fragments);
+                assert_eq!(num_msg, messages);  
+            }    
+        }); 
     }
 
     #[test]
     #[ignore]
     fn transmission_queue_throughput() {
+        const NUM_MSG: usize = 10_000_000;
+
+        async fn schedule(payload_size: usize, queue: Arc<TransmissionQueue>, counter: Arc<AtomicUsize>) {
+            // Send reliable messages
+            let reliable = true;
+            let key = ResKey::RName("test".to_string());
+            let info = None;
+            let payload = RBuf::from(vec![0u8; payload_size]);
+            let reply_context = None;
+            let attachment = None;
+
+            let message = ZenohMessage::make_data(
+                reliable, key, info, payload, reply_context, attachment
+            );
+
+            println!(">>> Sending {} messages with payload size: {}", NUM_MSG, payload_size);
+            for _ in 0..NUM_MSG {
+                queue.push_zenoh_message(message.clone(), QUEUE_PRIO_DATA).await;
+                counter.fetch_add(1, Ordering::Relaxed);
+            }
+            println!(">>> Done sending {} with payload size: {}", NUM_MSG, payload_size);
+        }
+
+        async fn consume(queue: Arc<TransmissionQueue>, c_batches: Arc<AtomicUsize>, c_bytes: Arc<AtomicUsize>) {
+            loop {
+                let (batch, priority) = queue.pull().await;
+                c_batches.fetch_add(1, Ordering::Relaxed);
+                c_bytes.fetch_add(batch.len(), Ordering::Relaxed);   
+                queue.push_serialization_batch(batch, priority).await;
+            }     
+        }
+
+        async fn stats(
+            c_payload: Arc<AtomicUsize>, 
+            c_messages: Arc<AtomicUsize>, 
+            c_batches: Arc<AtomicUsize>, 
+            c_bytes: Arc<AtomicUsize>
+        ) {
+            loop {
+                task::sleep(Duration::from_millis(1_000)).await;
+                let payload = c_payload.load(Ordering::Relaxed);
+                let messages = c_messages.swap(0, Ordering::Relaxed);
+                let batches = c_batches.swap(0, Ordering::Relaxed);
+                let bytes = c_bytes.swap(0, Ordering::Relaxed);
+                let throughput = 8*bytes/1_000_000;
+                println!("Payload: {}\t\tMessages: {}\t\tBatches: {}\t\tBytes: {}\t\tThroughput: {} Mbps", 
+                            payload, messages, batches, bytes, throughput);
+            }
+        }
+        
         // Queue
         let batch_size = *SESSION_BATCH_SIZE;
         let is_streamed = true;

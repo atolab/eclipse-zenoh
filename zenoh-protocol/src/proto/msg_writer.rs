@@ -154,7 +154,7 @@ impl WBuf {
                 check!(self.write_zint(*sn));
                 match payload {
                     FramePayload::Fragment { buffer, .. } => {
-                        check!(self.write_rbuf(&buffer));
+                        check!(self.write_rbuf_slices(&buffer));
                     }, 
                     FramePayload::Messages { messages } => {
                         for m in messages {

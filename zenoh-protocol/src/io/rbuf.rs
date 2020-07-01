@@ -47,6 +47,11 @@ impl RBuf {
         &self.slices[..]
     }
 
+    #[inline]
+    pub fn drain_slices(self) -> Vec<ArcSlice> {
+        self.slices
+    }
+
     pub fn as_ioslices(&self) -> Vec<IoSlice> {
         let mut result = Vec::with_capacity(self.slices.len());
         for s in &self.slices {

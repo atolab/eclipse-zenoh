@@ -191,7 +191,11 @@ impl RBuf {
                     let sn = self.read_zint()?;
 
                     let payload = if smsg::has_flag(header, smsg::flag::F) {
-                        let buffer = RBuf::from(self.read_bytes_array()?);
+                        // A fragmented frame is not supposed to be followed by
+                        // any other frame in the same batch. Read all the bytes.
+                        let mut tmp = vec![0; self.readable()];                        
+                        self.read_bytes(tmp.as_mut_slice())?;
+                        let buffer = RBuf::from(tmp);
                         let is_final = smsg::has_flag(header, smsg::flag::E);
 
                         FramePayload::Fragment { buffer, is_final }
