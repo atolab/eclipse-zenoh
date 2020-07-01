@@ -79,43 +79,56 @@ impl Channel {
     /*   MESSAGE RECEIVED FROM THE LINK  */
     /*************************************/
     async fn process_reliable_frame(&self, sn: ZInt, payload: FramePayload) -> Action {
-        let mut guard = zasynclock!(self.rx_reliable);
-
-        match guard.sn.precedes(sn) {
-            Ok(precedes) => if precedes {
-                // Set will always return OK because we have already checked
-                // with precedes() that the sn has the right resolution
-                let _ = guard.sn.set(sn);
-                match payload {
-                    FramePayload::Fragment { .. } => {
-                        unimplemented!("Fragmentation not implemented");
-                    },
-                    FramePayload::Messages { mut messages } => {
-                        for msg in messages.drain(..) {
-                            log::trace!("Session: {}. Message: {:?}", self.get_peer(), msg);
-                            let _ = zasyncopt!(self.callback).handle_message(msg).await;
-                        }                        
-                    }
-                }
-                // Keep reading
-                Action::Read
-            } else {
-                log::warn!("Reliableframe with invalid SN dropped: {}", sn);
-                // @TODO: Drop the fragments if needed
-                // Keep reading
-                Action::Read
+        match payload {
+            FramePayload::Fragment { .. } => {
+                unimplemented!("Fragmentation not implemented");
             },
-            Err(e) => {
-                log::warn!("Invalid SN in reliable frame: {}. \
-                            Closing the session with peer: {}", e, self.get_peer());
-                // Drop the guard before closing the session
-                drop(guard);
-                // Delete the whole session
-                self.delete().await;
-                // Close the link
-                Action::Close
+            FramePayload::Messages { mut messages } => {
+                for msg in messages.drain(..) {
+                    log::trace!("Session: {}. Message: {:?}", self.get_peer(), msg);
+                    let _ = zasyncopt!(self.callback).handle_message(msg).await;
+                }                        
             }
         }
+        Action::Read
+
+        // let mut guard = zasynclock!(self.rx_reliable);
+
+        // match guard.sn.precedes(sn) {
+        //     Ok(precedes) => if precedes {
+        //         // Set will always return OK because we have already checked
+        //         // with precedes() that the sn has the right resolution
+        //         let _ = guard.sn.set(sn);
+        //         match payload {
+        //             FramePayload::Fragment { .. } => {
+        //                 unimplemented!("Fragmentation not implemented");
+        //             },
+        //             FramePayload::Messages { mut messages } => {
+        //                 for msg in messages.drain(..) {
+        //                     log::trace!("Session: {}. Message: {:?}", self.get_peer(), msg);
+        //                     let _ = zasyncopt!(self.callback).handle_message(msg).await;
+        //                 }                        
+        //             }
+        //         }
+        //         // Keep reading
+        //         Action::Read
+        //     } else {
+        //         log::warn!("Reliableframe with invalid SN dropped: {}", sn);
+        //         // @TODO: Drop the fragments if needed
+        //         // Keep reading
+        //         Action::Read
+        //     },
+        //     Err(e) => {
+        //         log::warn!("Invalid SN in reliable frame: {}. \
+        //                     Closing the session with peer: {}", e, self.get_peer());
+        //         // Drop the guard before closing the session
+        //         drop(guard);
+        //         // Delete the whole session
+        //         self.delete().await;
+        //         // Close the link
+        //         Action::Close
+        //     }
+        // }
 
         // @TODO: Implement the reordering and reliability. Wait for missing messages.
         // let mut guard = zasynclock!(self.rx);
@@ -171,44 +184,57 @@ impl Channel {
         // }        
     }
 
-    async fn process_best_effort_frame(&self, sn: ZInt, payload: FramePayload) -> Action {        
-        let mut guard = zasynclock!(self.rx_best_effort);
-
-        match guard.sn.precedes(sn) {
-            Ok(precedes) => if precedes {
-                // Set will always return OK because we have already checked
-                // with precedes() that the sn has the right resolution
-                let _ = guard.sn.set(sn);
-                match payload {
-                    FramePayload::Fragment { .. } => {
-                        unimplemented!("Fragmentation not implemented");
-                    },
-                    FramePayload::Messages { mut messages } => {
-                        for msg in messages.drain(..) {
-                            log::trace!("Session: {}. Message: {:?}", self.get_peer(), msg);
-                            let _ = zasyncopt!(self.callback).handle_message(msg).await;
-                        }                        
-                    }
-                }
-                // Keep reading
-                Action::Read
-            } else {
-                log::warn!("Best effort frame with invalid SN dropped: {}", sn);
-                // @TODO: Drop the fragments if needed
-                // Keep reading
-                Action::Read
+    async fn process_best_effort_frame(&self, sn: ZInt, payload: FramePayload) -> Action {      
+        match payload {
+            FramePayload::Fragment { .. } => {
+                unimplemented!("Fragmentation not implemented");
             },
-            Err(e) => {
-                log::warn!("Invalid SN in best effort frame: {}. \
-                            Closing the session with peer: {}", e, self.get_peer());
-                // Drop the guard before closing the session
-                drop(guard);
-                // Delete the whole session
-                self.delete().await;
-                // Close the link
-                Action::Close
+            FramePayload::Messages { mut messages } => {
+                for msg in messages.drain(..) {
+                    log::trace!("Session: {}. Message: {:?}", self.get_peer(), msg);
+                    let _ = zasyncopt!(self.callback).handle_message(msg).await;
+                }                        
             }
         }
+        Action::Read
+
+        // let mut guard = zasynclock!(self.rx_best_effort);
+
+        // match guard.sn.precedes(sn) {
+        //     Ok(precedes) => if precedes {
+        //         // Set will always return OK because we have already checked
+        //         // with precedes() that the sn has the right resolution
+        //         let _ = guard.sn.set(sn);
+        //         match payload {
+        //             FramePayload::Fragment { .. } => {
+        //                 unimplemented!("Fragmentation not implemented");
+        //             },
+        //             FramePayload::Messages { mut messages } => {
+        //                 for msg in messages.drain(..) {
+        //                     log::trace!("Session: {}. Message: {:?}", self.get_peer(), msg);
+        //                     let _ = zasyncopt!(self.callback).handle_message(msg).await;
+        //                 }                        
+        //             }
+        //         }
+        //         // Keep reading
+        //         Action::Read
+        //     } else {
+        //         log::warn!("Best effort frame with invalid SN dropped: {}", sn);
+        //         // @TODO: Drop the fragments if needed
+        //         // Keep reading
+        //         Action::Read
+        //     },
+        //     Err(e) => {
+        //         log::warn!("Invalid SN in best effort frame: {}. \
+        //                     Closing the session with peer: {}", e, self.get_peer());
+        //         // Drop the guard before closing the session
+        //         drop(guard);
+        //         // Delete the whole session
+        //         self.delete().await;
+        //         // Close the link
+        //         Action::Close
+        //     }
+        // }
     }
 
     async fn process_close(&self, link: &Link, pid: Option<PeerId>, reason: u8, link_only: bool) -> Action {
@@ -250,13 +276,13 @@ impl TransportTrait for Channel {
         log::trace!("Received from peer {} on link {}: {:?}", self.get_peer(), link, message);
 
         // Mark the link as alive for link and session lease
-        let guard = zasyncread!(self.links);
-        if let Some(link) = guard.iter().find(|l| l.get_link() == link) {
-            link.mark_alive();
-        } else {
-            return Action::Close
-        }
-        drop(guard);
+        // let guard = zasyncread!(self.links);
+        // if let Some(link) = guard.iter().find(|l| l.get_link() == link) {
+        //     link.mark_alive();
+        // } else {
+        //     return Action::Close
+        // }
+        // drop(guard);
 
         // Process the received message
         match message.body {

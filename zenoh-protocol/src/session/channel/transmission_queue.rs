@@ -578,13 +578,14 @@ mod tests {
                 
         // Total amount of bytes to send in each test
         let bytes: usize = 100_000_000;
+        let max_msgs: usize = 1_000;
         // Paylod size of the messages
         let payload_sizes = [8, 64, 512, 4_096, 8_192, 32_768, 262_144, 2_097_152];
         // Sleep time for reading the number of received messages after scheduling completion
         let sleep = Duration::from_millis(1_000);
         task::block_on(async {
             for ps in payload_sizes.iter() {                
-                let num_msg = bytes / ps;     
+                let num_msg = max_msgs.min(bytes / ps);
                 println!(">>> Sending {} messages with payload size: {}", num_msg, ps);                      
                 schedule(num_msg, *ps, queue.clone()).await;
                 task::sleep(sleep).await;  
