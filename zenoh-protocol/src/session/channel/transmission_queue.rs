@@ -121,9 +121,7 @@ impl CircularBatchIn {
                 if self.try_serialize_session_message($message).await {
                     // Notify if needed
                     if self.not_empty.has_waiting_list() {
-                        let batch = self.inner.pop_front().unwrap();
-                        let mut guard = zasynclock!(self.state_out);
-                        guard[self.priority].push(batch);
+                        let guard = zasynclock!(self.state_out);
                         self.not_empty.notify(guard).await;
                     }
                     return
@@ -232,9 +230,7 @@ impl CircularBatchIn {
                 if self.try_serialize_zenoh_message(&message).await {
                     // Notify if needed
                     if self.not_empty.has_waiting_list() {
-                        let batch = self.inner.pop_front().unwrap();
-                        let mut guard = zasynclock!(self.state_out);
-                        guard[self.priority].push(batch);
+                        let guard = zasynclock!(self.state_out);
                         self.not_empty.notify(guard).await;
                     }
                     return
@@ -251,7 +247,7 @@ impl CircularBatchIn {
         //   1) remove the current batch from the IN pipeline
         //   2) add the batch to the OUT pipeline        
         if let Some(batch) = self.pull() {
-            // The previous batch wasn't empty
+            // The previous batch wasn't empty, move it to the state OUT pipeline
             let mut guard = zasynclock!(self.state_out);
             guard[self.priority].push(batch);
             // Notify if needed
@@ -688,8 +684,7 @@ mod tests {
             stats(c_payload, c_messages, c_batches, c_bytes).await;
         });
         
-        // for ps in [64, 256, 1024, 8_100, 16_384, 32_768, 65_536, 10_000_000].iter() {
-        for ps in [10_000_000].iter() {  
+        for ps in [64, 256, 1024, 8_100, 16_384, 32_768, 65_536, 10_000_000].iter() {
             payload_size.store(*ps, Ordering::Relaxed);                 
             task::block_on(schedule(*ps, queue.clone(), counter_messages.clone()));            
         }
