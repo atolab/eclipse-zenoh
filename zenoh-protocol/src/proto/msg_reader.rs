@@ -35,6 +35,38 @@ impl RBuf {
 
             // Read the body
             match smsg::mid(header) {
+                FRAME => {
+                    let ch = smsg::has_flag(header, smsg::flag::R);
+                    let sn = self.read_zint()?;
+
+                    let payload = if smsg::has_flag(header, smsg::flag::F) {
+                        // A fragmented frame is not supposed to be followed by
+                        // any other frame in the same batch. Read all the bytes.
+                        let mut buffer = RBuf::new();
+                        self.drain_into_rbuf(&mut buffer);
+                        let is_final = smsg::has_flag(header, smsg::flag::E);
+
+                        FramePayload::Fragment { buffer, is_final }
+                    } else {
+                        // @TODO: modify the get_pos/set_pos to mark/revert 
+                        let mut messages: Vec<ZenohMessage> = Vec::with_capacity(1);
+                        loop {
+                            let pos = self.get_pos();
+                            if let Ok(msg) = self.read_zenoh_message() {
+                                messages.push(msg);
+                            } else {
+                                self.set_pos(pos)?;
+                                break
+                            }
+                        }
+                        
+                        FramePayload::Messages { messages }
+                    };
+
+                    let body = SessionBody::Frame { ch, sn, payload };
+                    break (header, body)
+                },
+                
                 ATTACHMENT => {
                     attachment = Some(self.read_deco_attachment(header)?);
                     continue
@@ -191,40 +223,7 @@ impl RBuf {
                     };
 
                     break (header, body)
-                },
-
-                FRAME => {
-                    let ch = smsg::has_flag(header, smsg::flag::R);
-                    let sn = self.read_zint()?;
-
-                    let payload = if smsg::has_flag(header, smsg::flag::F) {
-                        // A fragmented frame is not supposed to be followed by
-                        // any other frame in the same batch. Read all the bytes.
-                        let mut tmp = vec![0; self.readable()];                        
-                        self.read_bytes(tmp.as_mut_slice())?;
-                        let buffer = RBuf::from(tmp);
-                        let is_final = smsg::has_flag(header, smsg::flag::E);
-
-                        FramePayload::Fragment { buffer, is_final }
-                    } else {
-                        // @TODO: modify the get_pos/set_pos to mark/revert 
-                        let mut messages: Vec<ZenohMessage> = Vec::with_capacity(1);
-                        loop {
-                            let pos = self.get_pos();
-                            if let Ok(msg) = self.read_zenoh_message() {
-                                messages.push(msg);
-                            } else {
-                                self.set_pos(pos)?;
-                                break
-                            }
-                        }
-                        
-                        FramePayload::Messages { messages }
-                    };
-
-                    let body = SessionBody::Frame { ch, sn, payload };
-                    break (header, body)
-                },
+                },                
 
                 unknown => return zerror!(ZErrorKind::InvalidMessage {
                     descr: format!("Session message with unknown ID: {}", unknown)

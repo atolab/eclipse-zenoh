@@ -210,24 +210,32 @@ impl RBuf {
 
     // Read 'len' bytes from 'self' and add those to 'dest'
     // This is 0-copy, only ArcSlices from 'self' are added to 'dest', without cloning the original buffer.
+    fn read_into_rbuf_no_check(&mut self, dest: &mut RBuf, len: usize) {
+        let mut to_copy = len;
+        while to_copy > 0 {
+            let remain_in_slice = self.current_slice().len() - self.pos.1;
+            let l = std::cmp::min(to_copy, remain_in_slice);
+            dest.add_slice(self.current_slice().new_sub_slice(self.pos.1, self.pos.1+l));
+            self.pos.0 += 1;
+            self.pos.1 = 0;
+            to_copy -= l;
+        }
+    }
+
+    // Read 'len' bytes from 'self' and add those to 'dest'
     pub fn read_into_rbuf(&mut self, dest: &mut RBuf, len: usize) -> ZResult<()> {
         if self.readable() >= len {
-            let mut to_copy: usize = len;
-            while to_copy > 0 {
-                let remain_in_slice = self.current_slice().len() - self.pos.1;
-                let l = std::cmp::min(to_copy, remain_in_slice);
-                dest.add_slice(self.current_slice().new_sub_slice(self.pos.1, self.pos.1+l));
-                self.pos.0 += 1;
-                self.pos.1 = 0;
-                to_copy -= l;
-            }
+            self.read_into_rbuf_no_check(dest, len);
             Ok(())
         } else {
             zerror!(ZErrorKind::BufferUnderflow { missing: 1 }) 
         }
     }
 
-
+    // Read all the bytes from 'self' and add those to 'dest'
+    pub fn drain_into_rbuf(&mut self, dest: &mut RBuf) {
+        self.read_into_rbuf_no_check(dest, self.readable());
+    }
 }
 
 impl fmt::Display for RBuf {
