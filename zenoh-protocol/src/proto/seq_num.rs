@@ -65,6 +65,11 @@ impl SeqNum {
     }
 
     #[inline]
+    pub fn semi_int(&self) -> ZInt {
+        self.semi_int
+    }
+
+    #[inline]
     pub fn get(&self) -> ZInt {
         self.value
     }
@@ -150,7 +155,7 @@ impl SeqNum {
         };
 
         Ok(gap)
-    }    
+    }
 }
 
 

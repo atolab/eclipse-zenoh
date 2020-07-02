@@ -13,7 +13,7 @@
 //
 use async_trait::async_trait;
 
-use super::{Channel};
+use super::{Channel, DefragBuffer};
 
 use crate::core::{PeerId, ZInt};
 use crate::link::Link;
@@ -29,47 +29,51 @@ use zenoh_util::{zasynclock, zasyncread, zasyncopt};
 /*************************************/
 
 pub(super) struct ChannelRxReliable {    
-    sn: SeqNum
+    sn: SeqNum,
+    defrag_buffer: DefragBuffer
 }
 
 impl ChannelRxReliable {
-    pub(super) fn new(
-        sn_resolution: ZInt,
-        initial_sn: ZInt
+    pub(super) fn new(        
+        initial_sn: ZInt,
+        sn_resolution: ZInt
     ) -> ChannelRxReliable {
         // Set the sequence number in the state as it had 
         // received a message with initial_sn - 1
-        let initial_sn = if initial_sn == 0 {
+        let last_initial_sn = if initial_sn == 0 {
             sn_resolution
         } else {
             initial_sn - 1
         };
 
         ChannelRxReliable {
-            sn: SeqNum::new(initial_sn, sn_resolution),
+            sn: SeqNum::new(last_initial_sn, sn_resolution),
+            defrag_buffer: DefragBuffer::new(initial_sn, sn_resolution)
         }
     }
 }
 
 pub(super) struct ChannelRxBestEffort {    
     sn: SeqNum,
+    defrag_buffer: DefragBuffer
 }
 
 impl ChannelRxBestEffort {
-    pub(super) fn new(
-        sn_resolution: ZInt,
-        initial_sn: ZInt
+    pub(super) fn new(        
+        initial_sn: ZInt,
+        sn_resolution: ZInt
     ) -> ChannelRxBestEffort {
         // Set the sequence number in the state as it had 
         // received a message with initial_sn - 1
-        let initial_sn = if initial_sn == 0 {
+        let last_initial_sn = if initial_sn == 0 {
             sn_resolution
         } else {
             initial_sn - 1
         };
 
         ChannelRxBestEffort {
-            sn: SeqNum::new(initial_sn, sn_resolution),
+            sn: SeqNum::new(last_initial_sn, sn_resolution),
+            defrag_buffer: DefragBuffer::new(initial_sn, sn_resolution)
         }
     }
 }
@@ -87,8 +91,20 @@ impl Channel {
                 // with precedes() that the sn has the right resolution
                 let _ = guard.sn.set(sn);
                 match payload {
-                    FramePayload::Fragment { .. } => {
-                        unimplemented!("Fragmentation not implemented");
+                    FramePayload::Fragment { buffer, is_final } => {
+                        if guard.defrag_buffer.is_empty() {
+                            let _ = guard.defrag_buffer.sync(sn);
+                        } 
+                        let res = guard.defrag_buffer.push(sn, buffer);
+                        if res.is_ok() && is_final {
+                            match guard.defrag_buffer.defragment() {
+                                Ok(msg) => {
+                                    log::trace!("Session: {}. Message: {:?}", self.get_peer(), msg);
+                                    let _ = zasyncopt!(self.callback).handle_message(msg).await;
+                                },
+                                Err(e) => panic!("Session: {}. Error: {:?}", self.get_peer(), e)
+                            }
+                        }
                     },
                     FramePayload::Messages { mut messages } => {
                         for msg in messages.drain(..) {
@@ -101,7 +117,10 @@ impl Channel {
                 Action::Read
             } else {
                 log::warn!("Reliableframe with invalid SN dropped: {}", sn);
-                // @TODO: Drop the fragments if needed
+                // Drop the fragments if needed
+                if !guard.defrag_buffer.is_empty() {
+                    guard.defrag_buffer.clear();
+                }
                 // Keep reading
                 Action::Read
             },
@@ -180,8 +199,20 @@ impl Channel {
                 // with precedes() that the sn has the right resolution
                 let _ = guard.sn.set(sn);
                 match payload {
-                    FramePayload::Fragment { .. } => {
-                        unimplemented!("Fragmentation not implemented");
+                    FramePayload::Fragment { buffer, is_final } => {
+                        if guard.defrag_buffer.is_empty() {
+                            let _ = guard.defrag_buffer.sync(sn);
+                        } 
+                        let res = guard.defrag_buffer.push(sn, buffer);
+                        if res.is_ok() && is_final {
+                            match guard.defrag_buffer.defragment() {
+                                Ok(msg) => {
+                                    log::trace!("Session: {}. Message: {:?}", self.get_peer(), msg);
+                                    let _ = zasyncopt!(self.callback).handle_message(msg).await;
+                                },
+                                Err(e) => panic!("Session: {}. Error: {:?}", self.get_peer(), e)
+                            }
+                        }
                     },
                     FramePayload::Messages { mut messages } => {
                         for msg in messages.drain(..) {
@@ -194,7 +225,10 @@ impl Channel {
                 Action::Read
             } else {
                 log::warn!("Best effort frame with invalid SN dropped: {}", sn);
-                // @TODO: Drop the fragments if needed
+                // Drop the fragments if needed
+                if !guard.defrag_buffer.is_empty() {
+                    guard.defrag_buffer.clear();
+                }
                 // Keep reading
                 Action::Read
             },

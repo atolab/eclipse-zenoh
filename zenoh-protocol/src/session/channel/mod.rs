@@ -12,6 +12,7 @@
 //   ADLINK zenoh team, <zenoh@adlink-labs.tech>
 //
 mod batch;
+mod defragmentation;
 mod events;
 mod link;
 #[macro_use]
@@ -21,6 +22,7 @@ mod rx;
 mod transmission_queue;
 
 use batch::*;
+use defragmentation::*;
 use events::*;
 use link::*;
 // use reliability_queue::*;

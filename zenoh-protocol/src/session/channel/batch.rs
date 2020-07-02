@@ -232,6 +232,7 @@ impl SerializationBatch {
     }
 }
 
+
 #[cfg(test)]
 mod tests {
     use async_std::task;
