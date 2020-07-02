@@ -23,8 +23,8 @@ use crate::proto::{SeqNumGenerator, SessionMessage, WhatAmI, ZenohMessage};
 use crate::session::{MsgHandler, SessionManagerInner};
 use crate::session::defaults::QUEUE_PRIO_DATA;
 
-use zenoh_util::{zasyncread, zasyncwrite, zerror, zasyncopt};
-use zenoh_util::collections::{TimedEvent, Timer};
+use zenoh_util::{zasynclock, zasyncread, zasyncwrite, zerror, zasyncopt};
+use zenoh_util::collections::{TimedEvent, TimedHandle, Timer};
 use zenoh_util::core::{ZError, ZErrorKind, ZResult};
 
 
@@ -72,6 +72,8 @@ pub(crate) struct Channel {
     pub(super) links: Arc<RwLock<Vec<ChannelLink>>>,
     // The internal timer
     pub(super) timer: Timer,
+    // The lease event
+    pub(super) lease_event_handle: Mutex<Option<TimedHandle>>,
     // The callback
     pub(super) callback: RwLock<Option<Arc<dyn MsgHandler + Send + Sync>>>,
     // Weak reference to self
@@ -106,6 +108,7 @@ impl Channel {
             rx_best_effort: Mutex::new(ChannelRxBestEffort::new(sn_resolution, initial_sn_rx)),
             links: Arc::new(RwLock::new(Vec::new())),
             timer: Timer::new(),
+            lease_event_handle: Mutex::new(None),
             callback: RwLock::new(None),
             w_self: RwLock::new(None)
         }        
@@ -114,13 +117,8 @@ impl Channel {
     pub(crate) async fn initialize(&self, w_self: Weak<Self>) {
         // Initialize the weak reference to self
         *zasyncwrite!(self.w_self) = Some(w_self.clone());
-        // Lease event
-        let event = SessionLeaseEvent::new(w_self);
-        // Keep alive interval is expressed in milliseconds
-        let interval = Duration::from_millis(self.lease);
-        let event = TimedEvent::periodic(interval, event);
-        // Add the event to the timer
-        self.timer.add(event).await;
+        // Start the session lease timeout
+        self.start_session_lease().await;
     }
 
 
@@ -157,6 +155,26 @@ impl Channel {
         self.has_callback.store(true, Ordering::Relaxed);
     }
 
+    /*************************************/
+    /*          SESSION LEASE            */
+    /*************************************/
+    async fn start_session_lease(&self) {
+        // Lease event
+        let event = SessionLeaseEvent::new(zasyncopt!(self.w_self).clone());
+        // Session lease interval is expressed in milliseconds
+        let interval = Duration::from_millis(self.lease);
+        let event = TimedEvent::periodic(interval, event);
+        let handle = event.get_handle();
+        // Update the handle
+        let mut guard = zasynclock!(self.lease_event_handle);
+        if let Some(old_handle) = guard.take() {
+            old_handle.defuse();
+        }
+        *guard = Some(handle);
+        // Add the event to the timer
+        self.timer.add(event).await;
+    }
+                
     /*************************************/
     /*           TERMINATION             */
     /*************************************/
@@ -230,13 +248,13 @@ impl Channel {
             if let Some(l) = zlinkget!(guard, &link) {
                 l.schedule_zenoh_message(message, QUEUE_PRIO_DATA).await;
             } else {
-                log::warn!("Zenoh message has been dropped because link {} does not exist\
-                            in session with peer {}: {}", link, self.get_peer(), message);
+                log::trace!("Zenoh message has been dropped because link {} does not exist\
+                            in session with peer: {}", link, self.get_peer());
             }
         } else {
             let guard = zasyncread!(self.links);
             if guard.is_empty() {                
-                log::warn!("Zenoh message has been dropped because session with peer {} has no links: {}", self.get_peer(), message);
+                log::trace!("Zenoh message has been dropped because no links are available in session with peer: {}", self.get_peer());
             } else {
                 guard[0].schedule_zenoh_message(message, QUEUE_PRIO_DATA).await;
             }
@@ -262,6 +280,9 @@ impl Channel {
 
         // Add the link to the channel
         guard.push(link);
+
+        // Restart the session lease event
+        self.start_session_lease().await;
         
         Ok(())
     }
@@ -270,8 +291,11 @@ impl Channel {
         // Try to remove the link
         let mut guard = zasyncwrite!(self.links);
         if let Some(index) = zlinkindex!(guard, link) {
+            // Restart the session lease event
+            self.start_session_lease().await;
+            // Remove and close the link
             let link = guard.remove(index);
-            link.close().await
+            link.close().await           
         } else {
             zerror!(ZErrorKind::InvalidLink { 
                 descr: format!("Can not delete Link {} with peer: {}", link, self.get_peer())

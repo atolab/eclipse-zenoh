@@ -67,6 +67,7 @@ macro_rules! zrefill {
 
 
 impl CircularBatchIn {
+    #[allow(clippy::too_many_arguments)]
     fn new(
         priority: usize,
         capacity: usize,
@@ -399,8 +400,8 @@ impl TransmissionQueue {
             not_full[QUEUE_PRIO_RETX].clone(), not_empty.clone()
         ))));
         state_in.push(Arc::new(Mutex::new(CircularBatchIn::new(
-            QUEUE_PRIO_DATA, *QUEUE_SIZE_DATA, batch_size, is_streamed, sn_reliable.clone(), 
-            sn_best_effort.clone(), state_out.clone(), state_empty[QUEUE_PRIO_DATA].clone(), 
+            QUEUE_PRIO_DATA, *QUEUE_SIZE_DATA, batch_size, is_streamed, sn_reliable, 
+            sn_best_effort, state_out.clone(), state_empty[QUEUE_PRIO_DATA].clone(), 
             not_full[QUEUE_PRIO_DATA].clone(), not_empty.clone()
         ))));
 
@@ -594,99 +595,5 @@ mod tests {
                 assert_eq!(num_msg, messages);  
             }    
         }); 
-    }
-
-    #[test]
-    #[ignore]
-    fn transmission_queue_throughput() {
-        const NUM_MSG: usize = 10_000_000;
-
-        async fn schedule(payload_size: usize, queue: Arc<TransmissionQueue>, counter: Arc<AtomicUsize>) {
-            // Send reliable messages
-            let reliable = true;
-            let key = ResKey::RName("test".to_string());
-            let info = None;
-            let payload = RBuf::from(vec![0u8; payload_size]);
-            let reply_context = None;
-            let attachment = None;
-
-            let message = ZenohMessage::make_data(
-                reliable, key, info, payload, reply_context, attachment
-            );
-
-            println!(">>> Sending {} messages with payload size: {}", NUM_MSG, payload_size);
-            for _ in 0..NUM_MSG {
-                queue.push_zenoh_message(message.clone(), QUEUE_PRIO_DATA).await;
-                counter.fetch_add(1, Ordering::Relaxed);
-            }
-            println!(">>> Done sending {} with payload size: {}", NUM_MSG, payload_size);
-        }
-
-        async fn consume(queue: Arc<TransmissionQueue>, c_batches: Arc<AtomicUsize>, c_bytes: Arc<AtomicUsize>) {
-            loop {
-                let (batch, priority) = queue.pull().await;
-                c_batches.fetch_add(1, Ordering::Relaxed);
-                c_bytes.fetch_add(batch.len(), Ordering::Relaxed);   
-                queue.push_serialization_batch(batch, priority).await;
-            }     
-        }
-
-        async fn stats(
-            c_payload: Arc<AtomicUsize>, 
-            c_messages: Arc<AtomicUsize>, 
-            c_batches: Arc<AtomicUsize>, 
-            c_bytes: Arc<AtomicUsize>
-        ) {
-            loop {
-                task::sleep(Duration::from_millis(1_000)).await;
-                let payload = c_payload.load(Ordering::Relaxed);
-                let messages = c_messages.swap(0, Ordering::Relaxed);
-                let batches = c_batches.swap(0, Ordering::Relaxed);
-                let bytes = c_bytes.swap(0, Ordering::Relaxed);
-                let throughput = 8*bytes/1_000_000;
-                println!("Payload: {}\t\tMessages: {}\t\tBatches: {}\t\tBytes: {}\t\tThroughput: {} Mbps", 
-                            payload, messages, batches, bytes, throughput);
-            }
-        }
-        
-        // Queue
-        let batch_size = *SESSION_BATCH_SIZE;
-        let is_streamed = true;
-        let sn_reliable = Arc::new(Mutex::new(
-            SeqNumGenerator::new(0, *SESSION_SEQ_NUM_RESOLUTION)
-        ));
-        let sn_best_effort = Arc::new(Mutex::new(
-            SeqNumGenerator::new(0, *SESSION_SEQ_NUM_RESOLUTION)
-        ));
-        let queue = Arc::new(TransmissionQueue::new(
-            batch_size, is_streamed, sn_reliable, sn_best_effort
-        ));
-
-        // Counters
-        let payload_size = Arc::new(AtomicUsize::new(0));
-        let counter_messages = Arc::new(AtomicUsize::new(0));
-        let counter_batches = Arc::new(AtomicUsize::new(0));
-        let counter_bytes = Arc::new(AtomicUsize::new(0));
-
-        // Tasks
-        let c_queue = queue.clone();
-        let c_batches = counter_batches.clone();
-        let c_bytes = counter_bytes.clone();
-        task::spawn(async move {
-            consume(c_queue, c_batches, c_bytes).await;
-        });
-
-        let c_payload = payload_size.clone();
-        let c_messages = counter_messages.clone();
-        let c_batches = counter_batches.clone();
-        let c_bytes = counter_bytes.clone();
-        task::spawn(async move {
-            stats(c_payload, c_messages, c_batches, c_bytes).await;
-        });
-        
-        for ps in [64, 256, 1024, 8_100, 16_384, 32_768, 65_536, 10_000_000].iter() {
-            payload_size.store(*ps, Ordering::Relaxed);                 
-            task::block_on(schedule(*ps, queue.clone(), counter_messages.clone()));            
-        }
     }
 }

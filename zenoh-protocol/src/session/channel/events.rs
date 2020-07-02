@@ -42,7 +42,7 @@ impl KeepAliveEvent {
 #[async_trait]
 impl Timed for KeepAliveEvent {
     async fn run(&mut self) {
-        log::trace!("Schedule KEEP_ALIVE messages for link: {}", self.link);
+        log::trace!("Schedule KEEP_ALIVE message for link: {}", self.link);
         // Create the KEEP_ALIVE message
         let pid = None;
         let attachment = None;
@@ -74,23 +74,26 @@ impl LinkLeaseEvent {
 
 #[async_trait]
 impl Timed for LinkLeaseEvent {
-    async fn run(&mut self) {
-        // log::trace!("Verify link lease: {}", self.link);
-        
-        // if self.alive.get() {
-        //     self.alive.clear();
-        // } else if let Some(ch) = self.ch.upgrade() {
-        //     let links = ch.get_links().await;
-        //     if links.len() == 1 && links[0] == self.link {
-        //         log::warn!("Link {} has expired with peer: {}. No links left. Closing the session.", self.link, ch.get_peer());
-        //         // The last link has expired, close the whole session
-        //         let _ = ch.close(smsg::close_reason::EXPIRED).await;                
-        //     } else {
-        //         log::warn!("Link {} has expired with peer: {}", self.link, ch.get_peer());
-        //         // Close only the link
-        //         let _ = ch.close_link(&self.link, smsg::close_reason::EXPIRED).await;
-        //     }            
-        // }
+    async fn run(&mut self) {     
+        if self.alive.reset() {
+            // The link was alive
+            return
+        }
+
+        // Close the link or eventually the whole session
+        if let Some(ch) = self.ch.upgrade() {                        
+            let links = ch.get_links().await;
+            log::debug!("LINK LEASE");
+            if links.len() == 1 && links[0] == self.link {
+                log::warn!("Link {} has expired with peer: {}. No links left. Closing the session.", self.link, ch.get_peer());
+                // The last link has expired, close the whole session
+                let _ = ch.close(smsg::close_reason::EXPIRED).await;                
+            } else {
+                log::warn!("Link {} has expired with peer: {}", self.link, ch.get_peer());
+                // Close only the link
+                let _ = ch.close_link(&self.link, smsg::close_reason::EXPIRED).await;
+            }      
+        }
     }
 }
 
@@ -112,13 +115,14 @@ impl SessionLeaseEvent {
 #[async_trait]
 impl Timed for SessionLeaseEvent {
     async fn run(&mut self) {
-        // if let Some(ch) = self.ch.upgrade() {
-        //     let links = ch.get_links().await;
-        //     if links.is_empty() {
-        //         log::warn!("Session has expired with peer: {}", ch.get_peer());
-        //         // The last link has expired, close the whole session
-        //         let _ = ch.delete().await;                
-        //     }         
-        // }
+        if let Some(ch) = self.ch.upgrade() {            
+            let links = ch.get_links().await;
+            log::debug!("SESSION LEASE");
+            if links.is_empty() {
+                log::warn!("Session has expired with peer: {}", ch.get_peer());
+                // The last link has expired, close the whole session
+                let _ = ch.delete().await;                
+            }         
+        }
     }
 }

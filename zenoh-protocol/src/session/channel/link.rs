@@ -94,18 +94,13 @@ impl LinkAlive {
     }
 
     #[inline]    
-    pub(super) fn get(&self) -> bool {
-        self.inner.load(Ordering::Relaxed)
-    }
-
-    #[inline]    
     pub(super) fn mark(&self) {
         self.inner.store(true, Ordering::Relaxed);
     }
 
     #[inline]    
-    pub(super) fn clear(&self) {
-        self.inner.store(false, Ordering::Relaxed);
+    pub(super) fn reset(&self) -> bool {
+        self.inner.swap(false, Ordering::Relaxed)
     }
 }
 
@@ -121,6 +116,7 @@ pub(super) struct ChannelLink {
 }
 
 impl ChannelLink {
+    #[allow(clippy::too_many_arguments)]
     pub(super) fn new(
         ch: Weak<Channel>,
         link: Link,
@@ -147,17 +143,17 @@ impl ChannelLink {
         let event = KeepAliveEvent::new(queue.clone(), link.clone());
         // Keep alive interval is expressed in milliseconds
         let interval = Duration::from_millis(keep_alive);
-        let event = TimedEvent::periodic(interval, event);
+        let ka_event = TimedEvent::periodic(interval, event);
         // Get the handle of the periodic event
-        let ka_handle = event.get_handle();
+        let ka_handle = ka_event.get_handle();
 
         // Lease event
-        let event = LinkLeaseEvent::new(ch.clone(), alive.clone(), link.clone());
+        let event = LinkLeaseEvent::new(ch, alive.clone(), link.clone());
         // Keep alive interval is expressed in milliseconds
         let interval = Duration::from_millis(lease);
-        let event = TimedEvent::periodic(interval, event);
+        let ll_event = TimedEvent::periodic(interval, event);
         // Get the handle of the periodic event
-        let ll_handle = event.get_handle();
+        let ll_handle = ll_event.get_handle();
 
         // Event handles
         let handles = vec![ka_handle, ll_handle];
@@ -165,7 +161,7 @@ impl ChannelLink {
         // Channel for signal the termination of consume task
         let (sender, receiver) = channel::<()>(1);
 
-        // Spawn the consume task
+        // Spawn the timed events and the consume task
         let c_queue = queue.clone();
         let c_link = link.clone();
         let c_active = active.clone();
@@ -173,14 +169,21 @@ impl ChannelLink {
         let c_barrier = barrier.clone();
         let mut c_handles = handles.clone();
         task::spawn(async move {
-            // Add the keep alive event to the timer
-            timer.add(event).await;
-            // Start
-            let res = consume_task(c_queue, c_link.clone(), c_active.clone(), receiver, c_barrier).await;
+            // Add the keep alive and lease events to the timer
+            timer.add(ka_event).await;
+            timer.add(ll_event).await;
+            // Start the consume task
+            let res = consume_task(
+                c_queue, 
+                c_link.clone(), 
+                c_active.clone(), 
+                receiver, 
+                c_barrier
+            ).await;
             if res.is_err() {
                 // Cleanup upon an error
                 c_active.store(false, Ordering::Relaxed);
-                c_alive.clear();
+                c_alive.reset();
                 // Drain the timed events
                 for h in c_handles.drain(..) {
                     h.defuse();

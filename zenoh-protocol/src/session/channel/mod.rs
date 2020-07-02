@@ -14,6 +14,7 @@
 mod batch;
 mod events;
 mod link;
+#[macro_use]
 mod main;
 // mod reliability_queue;
 mod rx;
