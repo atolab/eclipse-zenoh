@@ -19,11 +19,11 @@ use std::fmt;
 use std::sync::atomic::{AtomicUsize, AtomicU64, Ordering};
 use std::collections::HashMap;
 use async_std::sync::RwLock;
-use log::{error, warn, info, trace};
+use log::{error, warn, trace};
 use zenoh_protocol:: {
     core::{ rname, ResourceId, ResKey },
     io::RBuf,
-    proto::{ Primitives, QueryTarget, QueryConsolidation, Reply, whatami, queryable},
+    proto::{ Primitives, QueryTarget, QueryConsolidation, queryable},
 };
 use zenoh_router::runtime::Runtime;
 use zenoh_util::{zerror, zconfigurable};
@@ -134,28 +134,12 @@ pub struct Session {
 
 impl Session {
 
-    pub(super) async fn new(locator: &str, _ps: Option<Properties>) -> Session {
+    pub(super) async fn new(config: Config, _ps: Option<Properties>) -> Session {
 
-        let runtime = Runtime::new(0, whatami::CLIENT);
-
-        // @TODO: scout if locator = "". For now, replace by "tcp/127.0.0.1:7447"
-        let locator = if locator.is_empty() { "tcp/127.0.0.1:7447" } else { &locator };
-
-        {
-            // @TODO: manage a tcp.port property (and tcp.interface?)
-            let orchestrator = &mut runtime.write().await.orchestrator;
-            // try to open TCP port 7447
-            if let Err(_err) = orchestrator.add_acceptor(&"tcp/127.0.0.1:7447".parse().unwrap()).await {
-                // if failed, try to connect to peer on locator
-                info!("Unable to open listening TCP port on 127.0.0.1:7447. Try connection to {}", locator);
-                if let Err(err) = orchestrator.open_session(&locator.parse().unwrap()).await {
-                    error!("Unable to connect to {}! {:?}", locator, err);
-                    std::process::exit(-1);
-                }
-            } else {
-                info!("Listening on TCP: 127.0.0.1:7447.");
-            }
-        }
+        let runtime = match Runtime::new(0, config).await {
+            Ok(runtime) => runtime,
+            _ => std::process::exit(-1),
+        };
 
         let session = Self::init(runtime).await;
 
@@ -480,7 +464,11 @@ impl Primitives for Session {
             }
         };
         for sender in senders {
-            sender.send((resname.clone(), payload.clone(), info.clone())).await;
+            sender.send( Sample {
+                res_name: resname.clone(),
+                payload: payload.clone(),
+                data_info: info.clone(),
+            }).await;
         }
     }
 
@@ -514,38 +502,25 @@ impl Primitives for Session {
         let pid = self.runtime.read().await.pid.clone(); // @TODO build/use prebuilt specific pid
             
         for (kind, req_sender) in kinds_and_senders {
-            req_sender.send((resname.clone(), predicate.clone(), RepliesSender{ kind, sender: rep_sender.clone() })).await;
+            req_sender.send( Query {
+                res_name: resname.clone(),
+                predicate: predicate.clone(),
+                replies_sender: RepliesSender{ kind, sender: rep_sender.clone() }
+            }).await;
         }
         drop(rep_sender); // all senders need to be dropped for the channel to close
 
         task::spawn( async move { // router is not re-entrant
-            while let Some((kind, sample_opt)) = rep_receiver.next().await {
-                match sample_opt {
-                    Some((resname, payload, info)) => {
-                        primitives.reply(qid, Reply::ReplyData {
-                            source_kind: kind, 
-                            replier_id: pid.clone(),
-                            reskey: ResKey::RName(resname), 
-                            info,
-                            payload,
-                        }).await;
-                    }
-                    None => {
-                        primitives.reply(qid, Reply::SourceFinal {
-                            source_kind: kind, 
-                            replier_id: pid.clone(),
-                        }).await;
-                    }
-                }
+            while let Some((kind, sample)) = rep_receiver.next().await {
+                primitives.reply_data(qid, kind, pid.clone(), ResKey::RName(sample.res_name), sample.data_info, sample.payload).await;
             }
-
-            primitives.reply(qid, Reply::ReplyFinal).await;
+            primitives.reply_final(qid).await;
         });
     }
 
-    async fn reply(&self, qid: ZInt, mut reply: Reply) {
-        trace!("recv Reply {:?} {:?}", qid, reply);
-        let rep_sender = {
+    async fn reply_data(&self, qid: ZInt, source_kind: ZInt, replier_id: PeerId, reskey: ResKey, data_info: Option<RBuf>, payload: RBuf) {
+        trace!("recv ReplyData {:?} {:?} {:?} {:?} {:?} {:?}", qid, source_kind, replier_id, reskey, data_info, payload);
+        let (rep_sender, reply) = {
             let state = &mut self.state.write().await;
             let rep_sender = match state.queries.get(&qid) {
                 Some(rep_sender) => rep_sender.clone(),
@@ -554,23 +529,22 @@ impl Primitives for Session {
                     return
                 }
             };
-            match &mut reply {
-                Reply::ReplyData {ref mut reskey, ..} => {
-                    let resname = match state.reskey_to_resname(&reskey) {
-                        Ok(name) => name,
-                        Err(e) => {
-                            error!("Received Reply for unkown reskey: {}", e);
-                            return
-                        }
-                    };
-                    *reskey = ResKey::RName(resname);
+            let res_name = match state.reskey_to_resname(&reskey) {
+                Ok(name) => name,
+                Err(e) => {
+                    error!("Received Reply for unkown reskey: {}", e);
+                    return
                 }
-                Reply::SourceFinal {..} => {} 
-                Reply::ReplyFinal {..} => {state.queries.remove(&qid);}
             };
-            rep_sender
+            (rep_sender, Reply { data: Sample{res_name, payload, data_info}, source_kind, replier_id })
         };
         rep_sender.send(reply).await;
+    }
+
+
+    async fn reply_final(&self, qid: ZInt) {
+        trace!("recv ReplyFinal {:?}", qid);
+        self.state.write().await.queries.remove(&qid);
     }
 
     async fn pull(&self, _is_final: bool, _reskey: &ResKey, _pull_id: ZInt, _max_samples: &Option<ZInt>) {
