@@ -41,7 +41,7 @@ impl ChannelRxReliable {
         // Set the sequence number in the state as it had 
         // received a message with initial_sn - 1
         let last_initial_sn = if initial_sn == 0 {
-            sn_resolution
+            sn_resolution - 1
         } else {
             initial_sn - 1
         };
@@ -66,7 +66,7 @@ impl ChannelRxBestEffort {
         // Set the sequence number in the state as it had 
         // received a message with initial_sn - 1
         let last_initial_sn = if initial_sn == 0 {
-            sn_resolution
+            sn_resolution - 1
         } else {
             initial_sn - 1
         };
@@ -103,7 +103,7 @@ impl Channel {
                                     log::trace!("Session: {}. Message: {:?}", self.get_peer(), msg);
                                     let _ = zasyncopt!(self.callback).handle_message(msg).await;
                                 },
-                                Err(e) => log::trace!("Session: {}. Defragment error: {:?}", self.get_peer(), e)
+                                Err(e) => log::trace!("Session: {}. Defragmentation error: {:?}", self.get_peer(), e)
                             }
                         }
                     },
@@ -158,7 +158,7 @@ impl Channel {
                                     log::trace!("Session: {}. Message: {:?}", self.get_peer(), msg);
                                     let _ = zasyncopt!(self.callback).handle_message(msg).await;
                                 },
-                                Err(e) => log::trace!("Session: {}. Defragment error: {:?}", self.get_peer(), e)
+                                Err(e) => log::trace!("Session: {}. Defragmentation error: {:?}", self.get_peer(), e)
                             }
                         }
                     },
