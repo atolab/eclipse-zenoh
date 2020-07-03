@@ -83,6 +83,7 @@ impl Channel {
     /*   MESSAGE RECEIVED FROM THE LINK  */
     /*************************************/
     async fn process_reliable_frame(&self, sn: ZInt, payload: FramePayload) -> Action {
+        // @TODO: Implement the reordering and reliability. Wait for missing messages.
         let mut guard = zasynclock!(self.rx_reliable);
 
         match guard.sn.precedes(sn) {
@@ -102,7 +103,7 @@ impl Channel {
                                     log::trace!("Session: {}. Message: {:?}", self.get_peer(), msg);
                                     let _ = zasyncopt!(self.callback).handle_message(msg).await;
                                 },
-                                Err(e) => panic!("Session: {}. Error: {:?}", self.get_peer(), e)
+                                Err(e) => log::trace!("Session: {}. Defragment error: {:?}", self.get_peer(), e)
                             }
                         }
                     },
@@ -134,60 +135,7 @@ impl Channel {
                 // Close the link
                 Action::Close
             }
-        }
-
-        // @TODO: Implement the reordering and reliability. Wait for missing messages.
-        // let mut guard = zasynclock!(self.rx);
-
-        // Add the frame to the reliability queue for reordering
-        // match guard.reliable.insert(payload, sn) {
-        //     Ok(_) => {
-        //         // Drain all the queue
-        //         while let Some(payload) = guard.reliable.pull() {
-        //             match payload {
-        //                 FramePayload::Fragment { .. } => {
-        //                     unimplemented!("Fragmentation not implemented");
-        //                 },
-        //                 FramePayload::Messages { mut messages } => {
-        //                     for msg in messages.drain(..) {
-        //                         log::trace!("Session: {}. Message: {:?}", self.get_peer(), msg);
-        //                         let _ = guard.get_callback_ref().handle_message(msg).await;
-        //                     }
-        //                 }
-        //             }
-        //         }
-                
-        //         // Keep reading
-        //         Action::Read
-        //     }
-        //     Err(e) => match e.get_kind() {
-        //         ZErrorKind::InvalidResolution { .. } => {
-        //             log::warn!("Invalid SN in reliable frame: {}. \
-        //                         Closing the session with peer: {}", e, self.get_peer());
-        //             // Drop the guard before closing the session
-        //             drop(guard);
-        //             // Delete the whole session
-        //             self.delete().await;
-        //             // Close the link
-        //             Action::Close
-        //         },
-        //         _ => {
-        //             log::warn!("Reliable frame with invalid SN dropped: {}", e);
-
-        //             // We are out of sync, schedule an ACK_NACK
-        //             let sn = guard.reliable.get_base();
-        //             let mask = guard.reliable.get_mask();
-        //             let attachment = None;
-        //             let acknack = SessionMessage::make_ack_nack(sn, Some(mask), attachment);
-                    
-        //             let msg = MessageTx::Session(acknack, link.clone());
-        //             self.queue.push(msg, *QUEUE_PRIO_CTRL).await;
-
-        //             // Keep reading
-        //             Action::Read
-        //         }
-        //     }
-        // }        
+        }       
     }
 
     async fn process_best_effort_frame(&self, sn: ZInt, payload: FramePayload) -> Action {      
@@ -210,7 +158,7 @@ impl Channel {
                                     log::trace!("Session: {}. Message: {:?}", self.get_peer(), msg);
                                     let _ = zasyncopt!(self.callback).handle_message(msg).await;
                                 },
-                                Err(e) => panic!("Session: {}. Error: {:?}", self.get_peer(), e)
+                                Err(e) => log::trace!("Session: {}. Defragment error: {:?}", self.get_peer(), e)
                             }
                         }
                     },
@@ -288,7 +236,6 @@ impl TransportTrait for Channel {
         if let Some(link) = zlinkget!(guard, link) {
             link.mark_alive();
         } else {
-            log::debug!("LINK NOT FOUND!!!");
             return Action::Close
         }
         drop(guard);

@@ -35,6 +35,7 @@ impl RBuf {
 
             // Read the body
             match smsg::mid(header) {
+                // Frame as first for optimization reasons
                 FRAME => {
                     let ch = smsg::has_flag(header, smsg::flag::R);
                     let sn = self.read_zint()?;
@@ -248,6 +249,21 @@ impl RBuf {
 
             // Read the body
             match zmsg::mid(header) {
+                // Message data as first for optimization reasons
+                DATA => {
+                    let channel = zmsg::has_flag(header, zmsg::flag::R);
+                    let key = self.read_reskey(zmsg::has_flag(header, zmsg::flag::K))?;
+                    let info = if zmsg::has_flag(header, zmsg::flag::I) {
+                        Some(RBuf::from(self.read_bytes_array()?))
+                    } else { 
+                        None 
+                    };
+                    let payload = self.read_rbuf()?;
+
+                    let body = ZenohBody::Data { key, info, payload };
+                    break (header, body, channel)
+                },
+
                 // Decorators
                 REPLY_CONTEXT => {
                     reply_context = Some(self.read_deco_reply(header)?);
@@ -265,20 +281,6 @@ impl RBuf {
 
                     let body = ZenohBody::Declare { declarations };
                     let channel = zmsg::default_channel::DECLARE;
-                    break (header, body, channel)
-                },
-
-                DATA => {
-                    let channel = zmsg::has_flag(header, zmsg::flag::R);
-                    let key = self.read_reskey(zmsg::has_flag(header, zmsg::flag::K))?;
-                    let info = if zmsg::has_flag(header, zmsg::flag::I) {
-                        Some(RBuf::from(self.read_bytes_array()?))
-                    } else { 
-                        None 
-                    };
-                    let payload = RBuf::from(self.read_bytes_array()?);
-
-                    let body = ZenohBody::Data { key, info, payload };
                     break (header, body, channel)
                 },
 
@@ -331,7 +333,7 @@ impl RBuf {
 
     fn read_deco_attachment(&mut self, header: u8) -> ZResult<Attachment> {
         let encoding = smsg::flags(header);
-        let buffer = RBuf::from(self.read_bytes_array()?);
+        let buffer = self.read_rbuf()?;
         Ok(Attachment { encoding, buffer })
     }
 

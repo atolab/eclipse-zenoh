@@ -214,10 +214,9 @@ impl RBuf {
         let mut to_copy = len;
         while to_copy > 0 {
             let remain_in_slice = self.current_slice().len() - self.pos.1;
-            let l = std::cmp::min(to_copy, remain_in_slice);
+            let l = to_copy.min(remain_in_slice); 
             dest.add_slice(self.current_slice().new_sub_slice(self.pos.1, self.pos.1+l));
-            self.pos.0 += 1;
-            self.pos.1 = 0;
+            self.skip_bytes_no_check(l);
             to_copy -= l;
         }
     }

@@ -28,6 +28,25 @@ enum CurrentFrame {
     None
 }
 
+/// Serialization Batch
+/// 
+/// A [`SerializationBatch`][SerializationBatch] is a non-expandable and contigous region of memory
+/// that is used to serialize [`SessionMessage`][SessionMessage] and [`ZenohMessage`][ZenohMessage].
+/// 
+/// [`SessionMessage`][SessionMessage] are always serialized on the batch as theyr are, while
+/// [`ZenohMessage`][ZenohMessage] are always serializaed on the batch as part of a [`SessionMessage`]
+/// [SessionMessage] Frame. Reliable and Best Effort Frames can be interleaved on the same 
+/// [`SerializationBatch`][SerializationBatch] as long as they fit in the remaining buffer capacity.
+/// 
+/// In the serialized form, the [`SerializationBatch`][SerializationBatch] always contains one or more 
+/// [`SessionMessage`][SessionMessage]. In the particular case of [`SessionMessage`][SessionMessage] Frame,
+/// its payload is either (i) one or more complete [`ZenohMessage`][ZenohMessage] or (ii) a fragment of a
+/// a [`ZenohMessage`][ZenohMessage].
+/// 
+/// As an example, the content of the [`SerializationBatch`][SerializationBatch] in memory could be:
+/// 
+/// | Keep Alive | Frame Reliable<Zenoh Message, Zenoh Message> | Frame Best Effort<Zenoh Message Fragment> |
+/// 
 #[derive(Clone, Debug)]
 pub(super) struct SerializationBatch {
     // The buffer to perform the batching on
@@ -42,6 +61,22 @@ pub(super) struct SerializationBatch {
 }
 
 impl SerializationBatch {
+    /// Create a new [`SerializationBatch`][SerializationBatch] with a given size in bytes.
+    /// 
+    /// # Arguments
+    /// * `size` - The size in bytes of the contigous memory buffer to allocate on.
+    /// 
+    /// * `is_streamed` - The serialization batch is meant to be used for a stream-based transport 
+    ///                   protocol (e.g., TCP) in constrast to datagram-based transport protocol (e.g., UDP).
+    ///                   In case of `is_streamed` being true, the first 2 bytes of the serialization batch
+    ///                   are used to encode the total amount of serialized bytes as 16-bits little endian.
+    ///                   Writing these 2 bytes allows the receiver to detect the amount of bytes it is expected
+    ///                   to read when operating on non-boundary preserving transport protocols.  
+    ///
+    /// * `sn_reliable` - The sequence number generator for the reliable channel. 
+    /// 
+    /// * `sn_best_effort` - The sequence number generator for the best effort channel.
+    ///
     pub(super) fn new(
         size: usize, 
         is_streamed: bool,
@@ -62,11 +97,13 @@ impl SerializationBatch {
         batch
     }
 
+    /// Verify that the [`SerializationBatch`][SerializationBatch] has no serialized bytes.
     #[inline]
     pub(super) fn is_empty(&self) -> bool {
         self.len() == 0
     }
 
+    /// Get the total number of bytes that have been serialized on the [`SerializationBatch`][SerializationBatch].
     #[inline]
     pub(super) fn len(&self) -> usize {
         let len = self.buffer.len();
@@ -77,11 +114,14 @@ impl SerializationBatch {
         }
     }
 
+    /// Verify that the [`SerializationBatch`][SerializationBatch] is for a stream-based protocol, i.e., the first
+    /// 2 bytes are reserved to encode the total amount of serialized bytes as 16-bits little endian.
     #[inline]
     pub(super) fn is_streamed(&self) -> bool {
         self.is_streamed
     }
 
+    /// Clear the [`SerializationBatch`][SerializationBatch] memory buffer and related internal state.
     #[inline]
     pub(super) fn clear(&mut self) {
         self.current_frame = CurrentFrame::None;
@@ -91,6 +131,8 @@ impl SerializationBatch {
         }
     }
 
+    /// In case the [`SerializationBatch`][SerializationBatch] is for a stream-based protocol, use the first 2 bytes
+    /// to encode the total amount of serialized bytes as 16-bits little endian.
     #[inline]
     pub(super) fn write_len(&mut self) {
         if self.is_streamed() {
@@ -100,11 +142,23 @@ impl SerializationBatch {
         }
     }
 
+    /// Get a `&[u8]` to access the internal memory buffer, usually for transmitting it on the network.
     #[inline]
     pub(super) fn get_buffer(&self) -> &[u8] {
         self.buffer.get_first_slice(..)
     }
 
+    /// Gets a serialized [`ZenohMessage`][ZenohMessage] and fragment it on the [`SerializationBatch`][SerializationBatch].
+    /// 
+    /// # Arguments
+    /// * `reliable` - The serialized [`ZenohMessage`][ZenohMessage] is for the reliable or the best effort channel.
+    /// 
+    /// * `sn` - The reliable/best effort sequence number of the new [`ZenohMessage`][ZenohMessage] fragment.
+    ///
+    /// * `to_fragment` - The buffer containing the serialized [`ZenohMessage`][ZenohMessage] that requires fragmentation.
+    /// 
+    /// * `to_write` - The amount of bytes that still need to be fragmented.
+    /// 
     pub(super) async fn serialize_zenoh_fragment(
         &mut self, 
         reliable: bool, 
@@ -145,6 +199,11 @@ impl SerializationBatch {
         }
     }
 
+    /// Try to serialize a [`ZenohMessage`][ZenohMessage] on the [`SerializationBatch`][SerializationBatch].
+    /// 
+    /// # Arguments
+    /// * `message` - The [`ZenohMessage`][ZenohMessage] to serialize.
+    /// 
     pub(super) async fn serialize_zenoh_message(&mut self, message: &ZenohMessage) -> bool {
         // Keep track of eventual new frame and new sn
         let mut new_frame = None;
@@ -208,6 +267,11 @@ impl SerializationBatch {
         res
     }
 
+    /// Try to serialize a [`SessionMessage`][SessionMessage] on the [`SerializationBatch`][SerializationBatch].
+    /// 
+    /// # Arguments
+    /// * `message` - The [`SessionMessage`][SessionMessage] to serialize.
+    /// 
     pub(super) async fn serialize_session_message(&mut self, message: &SessionMessage) -> bool {
         // Mark the write operation
         self.buffer.mark();     

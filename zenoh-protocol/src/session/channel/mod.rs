@@ -19,7 +19,7 @@ mod link;
 mod main;
 // mod reliability_queue;
 mod rx;
-mod transmission_queue;
+mod tx_queue;
 
 use batch::*;
 use defragmentation::*;
@@ -27,6 +27,6 @@ use events::*;
 use link::*;
 // use reliability_queue::*;
 use rx::*;
-use transmission_queue::*;
+use tx_queue::*;
 
 pub(crate) use main::*;
