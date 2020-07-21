@@ -276,10 +276,10 @@ impl Channel {
         }
 
         // Create a channel link from a link
-        let link = ChannelLink::new(
-            zasyncopt!(self.w_self).clone(), link, self.batch_size, self.keep_alive, self.lease,
-            self.tx_sn_reliable.clone(), self.tx_sn_best_effort.clone(), self.timer.clone()
+        let mut link = ChannelLink::new(
+            link, self.batch_size, self.tx_sn_reliable.clone(), self.tx_sn_best_effort.clone()
         );
+        link.start(zasyncopt!(self.w_self).clone(), self.keep_alive, self.lease, &self.timer).await;
 
         // Add the link to the channel
         guard.push(link);

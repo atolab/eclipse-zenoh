@@ -53,6 +53,8 @@ pub(super) struct SerializationBatch {
     buffer: WBuf,    
     // It is a streamed batch
     is_streamed: bool,
+    // It is empty
+    is_empty: bool,
     // The link this batch is associated to
     current_frame: CurrentFrame,
     // The sn generators
@@ -86,6 +88,7 @@ impl SerializationBatch {
         let mut batch = SerializationBatch {
             buffer: WBuf::new(size, true),
             is_streamed,
+            is_empty: true,
             current_frame: CurrentFrame::None,
             sn_reliable,
             sn_best_effort
@@ -100,7 +103,17 @@ impl SerializationBatch {
     /// Verify that the [`SerializationBatch`][SerializationBatch] has no serialized bytes.
     #[inline]
     pub(super) fn is_empty(&self) -> bool {
-        self.len() == 0
+        self.is_empty
+    }
+
+    /// Get the capacity of the batch
+    pub(super) fn capacity(&self) -> usize {
+        let cap = self.buffer.capacity();
+        if self.is_streamed() {            
+            cap - LENGTH_BYTES.len()
+        } else {
+            cap
+        }
     }
 
     /// Get the total number of bytes that have been serialized on the [`SerializationBatch`][SerializationBatch].
@@ -124,6 +137,7 @@ impl SerializationBatch {
     /// Clear the [`SerializationBatch`][SerializationBatch] memory buffer and related internal state.
     #[inline]
     pub(super) fn clear(&mut self) {
+        self.is_empty = true;
         self.current_frame = CurrentFrame::None;
         self.buffer.clear();
         if self.is_streamed() {
@@ -159,7 +173,7 @@ impl SerializationBatch {
     /// 
     /// * `to_write` - The amount of bytes that still need to be fragmented.
     /// 
-    pub(super) async fn serialize_zenoh_fragment(
+    pub(super) fn serialize_zenoh_fragment(
         &mut self, 
         reliable: bool, 
         sn: ZInt,
@@ -190,6 +204,8 @@ impl SerializationBatch {
                 let written = to_write.min(space_left);
                 to_fragment.copy_into_wbuf(&mut self.buffer, written);
 
+                // Mark the batch as non-empty
+                self.is_empty = false;
                 return written
             } else {
                 // Revert the buffer
@@ -259,7 +275,10 @@ impl SerializationBatch {
             self.buffer.write_zenoh_message(&message)
         };
 
-        if !res {
+        if res {
+            // Mark the batch as non-empty
+            self.is_empty = false;
+        } else {
             // Revert the write operation
             self.buffer.revert();
         }
@@ -277,6 +296,8 @@ impl SerializationBatch {
         self.buffer.mark();     
         let res = self.buffer.write_session_message(&message);
         if res {
+            // Mark the batch as non-empty
+            self.is_empty = false;
             // Reset the current frame value
             self.current_frame = CurrentFrame::None;
         } else {
@@ -443,11 +464,11 @@ mod tests {
                     ); 
                     let written = batch.serialize_zenoh_fragment(
                         msg_in.is_reliable(), guard.get(), &mut wbuf, to_write
-                    ).await;
+                    );
                     assert_ne!(written, 0);
                     // Keep serializing
-                    to_write -= written;                    
-                    batches.push(batch);                                
+                    to_write -= written;
+                    batches.push(batch);
                 }
 
                 assert!(!batches.is_empty());

@@ -14,7 +14,7 @@
 use crate::core::ZInt;
 
 // Total number of queues
-pub(crate) const QUEUE_NUM: usize = 3;
+// pub(crate) const QUEUE_NUM: usize = 3;
 
 // Queue priorities
 pub(crate) const QUEUE_PRIO_CTRL: usize = 0;
@@ -45,7 +45,7 @@ zconfigurable! {
     // Parameters of the link transmission queue
     pub(crate) static ref QUEUE_SIZE_CTRL: usize = 1;
     pub(crate) static ref QUEUE_SIZE_RETX: usize = 1;
-    pub(crate) static ref QUEUE_SIZE_DATA: usize = 16;
+    pub(crate) static ref QUEUE_SIZE_DATA: usize = 1_024;
 
     pub(crate) static ref QUEUE_CONCURRENCY: usize = 16;
 }
